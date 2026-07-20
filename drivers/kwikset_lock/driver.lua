@@ -252,9 +252,12 @@ local function notifySettings()
   notify("SETTINGS", xmlWrap("lock_settings", body))
 end
 
--- Proxy user-schedule field <-> stored user.sched key mapping (numeric fields).
-local SCHED_FIELDS = {
-  days = "SCHEDULED_DAYS",
+-- Proxy user-schedule fields <-> stored user.sched keys. The proxy sends (and
+-- expects back) SCHEDULE_TYPE as a string ("daily"/"date_range") and
+-- SCHEDULED_DAYS as a comma-separated list of 7 booleans; the date/time fields
+-- are integers. Echoing the wrong types back leaves the Navigator's "Saving"
+-- dialog spinning.
+local SCHED_INT_FIELDS = {
   startDay = "START_DAY",
   startMonth = "START_MONTH",
   startYear = "START_YEAR",
@@ -263,8 +266,13 @@ local SCHED_FIELDS = {
   endYear = "END_YEAR",
   startTime = "START_TIME",
   endTime = "END_TIME",
+}
+local SCHED_STR_FIELDS = {
+  days = "SCHEDULED_DAYS",
   type = "SCHEDULE_TYPE",
 }
+local DEFAULT_SCHEDULED_DAYS = "false,false,false,false,false,false,false"
+local DEFAULT_SCHEDULE_TYPE = "daily"
 
 local function userFields(id, u)
   local s = u.sched or {}
@@ -273,7 +281,7 @@ local function userFields(id, u)
     USER_NAME = u.name or ("User " .. id),
     PASSCODE = u.code or "",
     IS_ACTIVE = u.active and true or false,
-    SCHEDULED_DAYS = s.days or 0,
+    SCHEDULED_DAYS = s.days or DEFAULT_SCHEDULED_DAYS,
     START_DAY = s.startDay or 0,
     START_MONTH = s.startMonth or 0,
     START_YEAR = s.startYear or 0,
@@ -282,7 +290,7 @@ local function userFields(id, u)
     END_YEAR = s.endYear or 0,
     START_TIME = s.startTime or 0,
     END_TIME = s.endTime or 0,
-    SCHEDULE_TYPE = s.type or 0,
+    SCHEDULE_TYPE = s.type or DEFAULT_SCHEDULE_TYPE,
     IS_RESTRICTED_SCHEDULE = s.restricted and true or false,
   }
 end
@@ -291,10 +299,16 @@ end
 --- the stored user, preserving existing values for fields that are absent.
 local function captureSchedule(u, tParams)
   local s = u.sched or {}
-  for field, param in pairs(SCHED_FIELDS) do
+  for field, param in pairs(SCHED_INT_FIELDS) do
     local v = tointeger(Select(tParams, param))
     if v ~= nil then
       s[field] = v
+    end
+  end
+  for field, param in pairs(SCHED_STR_FIELDS) do
+    local v = Select(tParams, param)
+    if v ~= nil then
+      s[field] = tostring(v)
     end
   end
   local restricted = Select(tParams, "IS_RESTRICTED_SCHEDULE")
@@ -322,14 +336,14 @@ local function notifyUsers()
         .. xmlNode("is_restricted_schedule", s.restricted and "true" or "false")
         .. xmlNode("start_time", s.startTime or 0)
         .. xmlNode("end_time", s.endTime or 0)
-        .. xmlNode("schedule_type", s.type or 0)
+        .. xmlNode("schedule_type", s.type or DEFAULT_SCHEDULE_TYPE)
         .. xmlNode("start_day", s.startDay or 0)
         .. xmlNode("start_month", s.startMonth or 0)
         .. xmlNode("start_year", s.startYear or 0)
         .. xmlNode("end_day", s.endDay or 0)
         .. xmlNode("end_month", s.endMonth or 0)
         .. xmlNode("end_year", s.endYear or 0)
-        .. xmlNode("scheduled_days", s.days or 0)
+        .. xmlNode("scheduled_days", s.days or DEFAULT_SCHEDULED_DAYS)
         .. "</user>"
     end
   end
