@@ -4,6 +4,8 @@
   <manufacturer>Kwikset</manufacturer>
   <model>Kwikset SmartCode</model>
   <creator>Derek Miller</creator>
+  <small image_source="c4z">icons/device_sm.png</small>
+  <large image_source="c4z">icons/device_lg.png</large>
   <control>lua_gen</control>
   <controlmethod>zigbee</controlmethod>
   <driver>DriverWorks</driver>
