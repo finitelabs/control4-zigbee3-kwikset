@@ -304,23 +304,36 @@ local function captureSchedule(u, tParams)
   u.sched = s
 end
 
---- Users are handed to the proxy as an XML list.
+--- Users are handed to the proxy as an XML list. Root element and per-user
+--- fields must match what the lock proxy expects (see the native driver).
 local function notifyUsers()
   log:trace("notifyUsers()")
   local body = ""
   for id = 1, MAX_USERS do
     local u = State.users[id]
     if u then
+      local s = u.sched or {}
       body = body
         .. "<user>"
         .. xmlNode("user_id", id)
         .. xmlNode("user_name", u.name or ("User " .. id))
         .. xmlNode("passcode", u.code or "")
         .. xmlNode("is_active", u.active and "true" or "false")
+        .. xmlNode("is_restricted_schedule", s.restricted and "true" or "false")
+        .. xmlNode("start_time", s.startTime or 0)
+        .. xmlNode("end_time", s.endTime or 0)
+        .. xmlNode("schedule_type", s.type or 0)
+        .. xmlNode("start_day", s.startDay or 0)
+        .. xmlNode("start_month", s.startMonth or 0)
+        .. xmlNode("start_year", s.startYear or 0)
+        .. xmlNode("end_day", s.endDay or 0)
+        .. xmlNode("end_month", s.endMonth or 0)
+        .. xmlNode("end_year", s.endYear or 0)
+        .. xmlNode("scheduled_days", s.days or 0)
         .. "</user>"
     end
   end
-  notify("USERS", xmlWrap("users", body))
+  notify("USERS", xmlWrap("lock_users", body))
 end
 
 -- ---------------------------------------------------------------------------
