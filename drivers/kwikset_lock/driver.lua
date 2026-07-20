@@ -62,6 +62,11 @@ local STATUS_UNLOCKED = "Unlocked"
 local STATUS_FAULT = "Jammed"
 local STATUS_UNKNOWN = "Unknown"
 
+-- Control4 lock proxy battery status values (drives the proxy's Status panel)
+local BATTERY_NORMAL = "normal"
+local BATTERY_WARNING = "warning"
+local BATTERY_CRITICAL = "critical"
+
 local MAX_USERS = 30
 local HISTORY_MAX = 50
 
@@ -215,9 +220,19 @@ local function notifyLockChanged(lastAction, source, manual)
   })
 end
 
+--- Map a battery percentage to the proxy's battery status value.
+local function batteryStatus(pct)
+  if pct <= 10 then
+    return BATTERY_CRITICAL
+  elseif pct <= 25 then
+    return BATTERY_WARNING
+  end
+  return BATTERY_NORMAL
+end
+
 local function notifyBattery()
   if State.battery ~= nil then
-    notify("BATTERY_STATUS_CHANGED", { BATTERY_STATUS = State.battery })
+    notify("BATTERY_STATUS_CHANGED", { BATTERY_STATUS = batteryStatus(State.battery) })
   end
 end
 
@@ -722,7 +737,6 @@ function OnZigbeePacketIn(packet, profileId, clusterId, groupId, srcEndpoint, ds
       if attrs[ATTR_BATT_PCT] then
         local pct = math.floor(attrs[ATTR_BATT_PCT].value / 2 + 0.5)
         State.battery = pct
-        UpdateProperty("Battery Status", pct .. "%")
         notifyBattery()
         if pct <= 15 then
           C4:FireEvent(EVENT_BATTERY_LOW)
@@ -747,9 +761,14 @@ function OnZigbeeOnlineStatusChanged(strStatus, strVersion, strSKU)
   State.online = online
   UpdateProperty("Driver Status", online and "Online" or "Offline")
   if online then
+    if strVersion and strVersion ~= "" then
+      UpdateProperty("Firmware Version", strVersion)
+    end
     -- Seed state from the lock (awake on join/report).
     readAttributes(CLUSTER_DOORLOCK, { ATTR_LOCK_STATE })
     readAttributes(CLUSTER_POWER, { ATTR_BATT_PCT })
+  else
+    UpdateProperty("Firmware Version", "--")
   end
 end
 

@@ -148,10 +148,6 @@ Displays the current version of the driver.
 
 Displays the firmware version reported by the lock.
 
-##### Battery Status (read-only)
-
-Displays the lock's most recent battery level.
-
 ##### Log Level \[ 0 - Fatal | 1 - Error | 2 - Warning | **_3 - Info_** | 4 - Debug | 5 - Trace | 6 - Ultra \]
 
 Sets the logging level. Default is `3 - Info`.

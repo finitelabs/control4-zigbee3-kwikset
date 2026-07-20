@@ -179,12 +179,6 @@
         <default>--</default>
       </property>
       <property>
-        <name>Battery Status</name>
-        <type>STRING</type>
-        <readonly>true</readonly>
-        <default>--</default>
-      </property>
-      <property>
         <name>Log Level</name>
         <type>LIST</type>
         <readonly>false</readonly>
