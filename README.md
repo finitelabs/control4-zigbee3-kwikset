@@ -95,6 +95,7 @@ outline of the basic steps for your convenience.
    the `.c4z` file.
 1. Use the "Search" tab to find the "Kwikset SmartCode (Zigbee 3)" driver and
    add one to your project for each lock you intend to join.
+   <br><img alt="Search Drivers" src="./images/search-drivers.png" width="300"/>
 1. Continue to [Joining the Lock](#joining-the-lock).
 
 ## Joining the Lock

@@ -136,10 +136,14 @@ outline of the basic steps for your convenience.
    the `.c4z` file.
 1. Use the "Search" tab to find the "Kwikset SmartCode (Zigbee 3)" driver and
    add one to your project for each lock you intend to join.
+   <br><img alt="Search Drivers" src="./images/search-drivers.png" width="300"/>
 1. Select the newly added driver in the "System Design" tab. You will notice
    that the `Cloud Status` reflects the license state. If you have purchased a
    license it will show `License Activated`, otherwise `Trial Running` and the
    remaining trial duration.
+1. You can refresh license status by selecting the "DriverCentral Cloud" driver
+   in the "System Design" tab and performing the "Check Drivers" action.
+   <br><img alt="Check Drivers" src="./images/check-drivers.png" width="300"/>
 1. Continue to [Joining the Lock](#joining-the-lock).
 
 <!-- #else -->
@@ -151,6 +155,7 @@ outline of the basic steps for your convenience.
    the `.c4z` file.
 1. Use the "Search" tab to find the "Kwikset SmartCode (Zigbee 3)" driver and
    add one to your project for each lock you intend to join.
+   <br><img alt="Search Drivers" src="./images/search-drivers.png" width="300"/>
 1. Continue to [Joining the Lock](#joining-the-lock).
 
 <!-- #endif -->
