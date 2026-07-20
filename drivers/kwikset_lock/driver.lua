@@ -82,6 +82,7 @@ local State = {
   autoLockSeconds = 0,
   adminCode = "",
   logItemCount = 5,
+  scheduleLockoutEnabled = false,
   users = {}, -- id -> { name, code, active, sched } (persisted)
   history = {}, -- array of { date, time, message, source }, newest last (persisted)
 }
@@ -241,7 +242,7 @@ local function notifySettings()
   local body = xmlNode("admin_code", State.adminCode)
     .. xmlNode("auto_lock_time", State.autoLockSeconds)
     .. xmlNode("log_item_count", State.logItemCount)
-    .. xmlNode("schedule_lockout_enabled", "false")
+    .. xmlNode("schedule_lockout_enabled", tostring(State.scheduleLockoutEnabled))
     .. xmlNode("lock_mode", "normal")
     .. xmlNode("log_failed_attempts", "false")
     .. xmlNode("wrong_code_attempts", "0")
@@ -423,6 +424,7 @@ local function loadState()
   State.autoLockSeconds = tonumber(persist:get("autoLockSeconds", 0)) or 0
   State.adminCode = persist:get("adminCode", "") or ""
   State.logItemCount = tointeger(persist:get("logItemCount", 5)) or 5
+  State.scheduleLockoutEnabled = toboolean(persist:get("scheduleLockoutEnabled", false)) or false
   State.history = persist:get("history", {}) or {}
 end
 
@@ -636,7 +638,7 @@ end
 
 function RFP.SET_AUTO_LOCK_SECONDS(idBinding, strCommand, tParams)
   log:trace("RFP.SET_AUTO_LOCK_SECONDS(%s, %s, %s)", idBinding, strCommand, tParams)
-  local secs = tointeger(Select(tParams, "AUTO_LOCK_SECONDS")) or tointeger(Select(tParams, "VALUE")) or 0
+  local secs = tointeger(Select(tParams, "SECONDS")) or 0
   State.autoLockSeconds = secs
   persist:set("autoLockSeconds", secs)
   -- ZCL AutoRelockTime is a u32 seconds attribute (0 = disabled).
@@ -654,7 +656,7 @@ end
 
 function RFP.SET_ADMIN_CODE(idBinding, strCommand, tParams)
   log:trace("RFP.SET_ADMIN_CODE(%s, %s)", idBinding, strCommand)
-  State.adminCode = tostring(Select(tParams, "ADMIN_CODE") or Select(tParams, "VALUE") or "")
+  State.adminCode = tostring(Select(tParams, "PASSCODE") or "")
   persist:set("adminCode", State.adminCode)
   notify("SETTING_CHANGED", { NAME = "admin_code", VALUE = State.adminCode })
   addHistory("Changed Admin Code", "Control4")
@@ -662,16 +664,22 @@ end
 
 function RFP.SET_NUMBER_LOG_ITEMS(idBinding, strCommand, tParams)
   log:trace("RFP.SET_NUMBER_LOG_ITEMS(%s, %s, %s)", idBinding, strCommand, tParams)
-  State.logItemCount = tointeger(Select(tParams, "VALUE")) or 5
+  State.logItemCount = tointeger(Select(tParams, "COUNT")) or 5
   persist:set("logItemCount", State.logItemCount)
   notify("SETTING_CHANGED", { NAME = "log_item_count", VALUE = tostring(State.logItemCount) })
+end
+
+function RFP.SET_SCHEDULE_LOCKOUT_ENABLED(idBinding, strCommand, tParams)
+  log:trace("RFP.SET_SCHEDULE_LOCKOUT_ENABLED(%s, %s, %s)", idBinding, strCommand, tParams)
+  State.scheduleLockoutEnabled = toboolean(Select(tParams, "ENABLED")) or false
+  persist:set("scheduleLockoutEnabled", State.scheduleLockoutEnabled)
+  notify("SETTING_CHANGED", { NAME = "schedule_lockout_enabled", VALUE = tostring(State.scheduleLockoutEnabled) })
 end
 
 -- Settings the proxy may send that have no ZCL mapping yet (kept for parity).
 local function noopSetting(idBinding, strCommand)
   log:trace("noopSetting(%s, %s)", idBinding, strCommand)
 end
-RFP.SET_SCHEDULE_LOCKOUT_ENABLED = noopSetting
 RFP.SET_LOCK_MODE = noopSetting
 RFP.SET_LOG_FAILED_ATTEMPTS = noopSetting
 RFP.SET_WRONG_CODE_ATTEMPTS = noopSetting
