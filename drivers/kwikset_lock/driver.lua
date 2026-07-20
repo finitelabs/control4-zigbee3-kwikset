@@ -715,6 +715,12 @@ function OnZigbeePacketIn(packet, profileId, clusterId, groupId, srcEndpoint, ds
     return
   end
   State.dstEndpoint = srcEndpoint or State.dstEndpoint
+  -- Any packet from the lock proves it is reachable. Recover Online here in case
+  -- a driver reload missed the one-shot OnZigbeeOnlineStatusChanged callback.
+  if not State.online then
+    State.online = true
+    UpdateProperty("Driver Status", "Online")
+  end
   local ok, err = pcall(function()
     local pos, fc = u8(packet, 1)
     local seq, cmd
@@ -883,6 +889,14 @@ function OnDriverLateInit()
   -- before a lock is joined.
   UpdateProperty("Driver Status", State.online and "Online" or "Offline")
   notifyLockInitialize()
+  -- A driver reload may not re-fire OnZigbeeOnlineStatusChanged for a lock that
+  -- is already joined and online, which would leave the driver stuck Offline.
+  -- Probe the lock once after init; if it is reachable it responds and
+  -- OnZigbeePacketIn recovers Online and seeds lock state + battery.
+  SetTimer("InitProbe", 3 * ONE_SECOND, function()
+    readAttributes(CLUSTER_DOORLOCK, { ATTR_LOCK_STATE })
+    readAttributes(CLUSTER_POWER, { ATTR_BATT_PCT })
+  end)
   --#ifndef DRIVERCENTRAL
   SetTimer("UpdateCheck", UPDATE_CHECK_INTERVAL, function()
     if toboolean(Properties["Automatic Updates"]) then
