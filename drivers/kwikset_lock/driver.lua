@@ -845,6 +845,11 @@ function OnDriverLateInit()
     end
   end
   gInitialized = true
+  -- Settle Driver Status now that init is done; the property loop above left it
+  -- at "Initializing" via the OPC.Driver_Status guard. Without this the driver
+  -- stays "Initializing" until the lock reports online, which never happens
+  -- before a lock is joined.
+  UpdateProperty("Driver Status", State.online and "Online" or "Offline")
   notifyLockInitialize()
   --#ifndef DRIVERCENTRAL
   SetTimer("UpdateCheck", UPDATE_CHECK_INTERVAL, function()
