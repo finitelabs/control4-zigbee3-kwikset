@@ -1,7 +1,21 @@
 # <span style="color:#D12231">Changelog</span>
 
-<!-- prettier-ignore-start -->
+<!--
+Template for a new release entry (copy below the heading, fill in, uncomment):
 
-<!-- prettier-ignore-end -->
+## v[Version] - YYYY-MM-DD
+
+### Added
+- Added
+
+### Fixed
+- Fixed
+
+### Changed
+- Changed
+
+### Removed
+- Removed
+-->
 
 ## Unreleased

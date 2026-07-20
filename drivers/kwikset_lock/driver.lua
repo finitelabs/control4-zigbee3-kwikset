@@ -1,5 +1,5 @@
 --#ifdef DRIVERCENTRAL
-DC_PID = nil
+DC_PID = 0 -- TODO: Assign DriverCentral product ID
 DC_X = nil
 DC_FILENAME = "kwikset_lock.c4z"
 --#else

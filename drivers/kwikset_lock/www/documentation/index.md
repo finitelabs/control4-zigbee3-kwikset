@@ -1,3 +1,5 @@
+<!-- Copyright 2026 Finite Labs, LLC. All rights reserved. -->
+
 <style>
 @media print {
    .noprint {
