@@ -13,11 +13,11 @@ works with any Kwikset Zigbee 3.0 SmartCode joined to the controller's Zigbee
 
 # <span style="color:#0057B8">Installer Setup</span>
 
-1.  Add the **Kwikset SmartCode (Zigbee 3)** driver to your project.
-2.  Put the lock into Zigbee pairing mode (see the lock's manual) and join it to
-    the controller's Zigbee 3.0 network.
-3.  Once it reports in, the lock resolves and its status, battery, and user
-    codes are managed from the standard Control4 lock interface.
+1. Add the **Kwikset SmartCode (Zigbee 3)** driver to your project.
+1. Put the lock into Zigbee pairing mode (see the lock's manual) and join it to
+   the controller's Zigbee 3.0 network.
+1. Once it reports in, the lock resolves and its status, battery, and user codes
+   are managed from the standard Control4 lock interface.
 
 # <span style="color:#0057B8">Programming</span>
 
@@ -35,4 +35,4 @@ works with any Kwikset Zigbee 3.0 SmartCode joined to the controller's Zigbee
 If you have any questions, supported-device requests, or issues to report, you
 can file an issue on GitHub:
 
-<https://github.com/finitelabs/control4-zigbee3-kwikset/issues/new>
+https://github.com/finitelabs/control4-zigbee3-kwikset/issues/new
