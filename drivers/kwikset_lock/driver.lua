@@ -52,6 +52,11 @@ local DL_OPER_EVENT = 0x20 -- Operating Event Notification
 
 -- DoorLock attributes
 local ATTR_LOCK_STATE = 0x0000 -- 0 not-fully / 1 locked / 2 unlocked
+local ATTR_NUM_PIN_USERS = 0x0012 -- NumberOfPINUsersSupported
+local ATTR_NUM_WEEKDAY_SCHED = 0x0014 -- NumberOfWeekDaySchedulesSupportedPerUser
+local ATTR_NUM_YEARDAY_SCHED = 0x0015 -- NumberOfYearDaySchedulesSupportedPerUser
+local ATTR_MAX_PIN_LEN = 0x0017 -- MaxPINCodeLength
+local ATTR_MIN_PIN_LEN = 0x0018 -- MinPINCodeLength
 local ATTR_AUTO_RELOCK = 0x0023 -- AutoRelockTime (u32 seconds)
 -- PowerConfig attributes
 local ATTR_BATT_PCT = 0x0021 -- BatteryPercentageRemaining (0.5%/step)
@@ -85,6 +90,10 @@ local State = {
   scheduleLockoutEnabled = false,
   users = {}, -- id -> { name, code, active, sched } (persisted)
   history = {}, -- array of { date, time, message, source }, newest last (persisted)
+  -- Lock capability limits, read from the DoorLock cluster at online. Seeded
+  -- with the SmartCode Convert's known values so validation works before the
+  -- lock reports.
+  limits = { maxUsers = MAX_USERS, minPin = 4, maxPin = 8, weekDaySched = 7, yearDaySched = 1 },
 }
 
 -- ---------------------------------------------------------------------------
@@ -529,24 +538,43 @@ local function writeUserPin(id, code)
 end
 
 --- Add or edit a user code. tParams carries USER_ID/USER_NAME/PASSCODE/IS_ACTIVE
---- and optional schedule fields.
+--- and optional schedule fields. The lock proxy has no reject-with-message path,
+--- so when a save would trip a lock limit we refuse it and surface the reason in
+--- the Last Action Description (notifyLockChanged), the only free-text channel.
 local function upsertUser(tParams, isEdit)
   local id = tointeger(Select(tParams, "USER_ID"))
   if id == nil then
-    for i = 1, MAX_USERS do
+    for i = 1, State.limits.maxUsers do
       if State.users[i] == nil then
         id = i
         break
       end
     end
   end
-  if id == nil then
-    log:warn("no free user slot (max %d)", MAX_USERS)
+  if id == nil or id > State.limits.maxUsers then
+    log:warn("no free user slot (max %d)", State.limits.maxUsers)
+    notifyLockChanged(
+      string.format("Cannot add user: lock supports %d codes", State.limits.maxUsers),
+      "Control4",
+      false
+    )
     return
+  end
+  local code = Select(tParams, "PASSCODE")
+  if code ~= nil and code ~= "" then
+    local n = #tostring(code)
+    if n < State.limits.minPin or n > State.limits.maxPin then
+      log:warn("rejecting user %d: code length %d not in %d-%d", id, n, State.limits.minPin, State.limits.maxPin)
+      notifyLockChanged(
+        string.format("Code must be %d-%d digits", State.limits.minPin, State.limits.maxPin),
+        "Control4",
+        false
+      )
+      return
+    end
   end
   local u = State.users[id] or {}
   u.name = Select(tParams, "USER_NAME") or u.name or ("User " .. id)
-  local code = Select(tParams, "PASSCODE")
   if code ~= nil and code ~= "" then
     u.code = tostring(code)
   end
@@ -762,6 +790,22 @@ function OnZigbeePacketIn(packet, profileId, clusterId, groupId, srcEndpoint, ds
         if attrs[ATTR_LOCK_STATE] then
           applyLockStatus(zclLockStatus(attrs[ATTR_LOCK_STATE].value), "Status", "Control4", false)
         end
+        -- Capability limits reported by the lock; use them for validation.
+        if attrs[ATTR_NUM_PIN_USERS] then
+          State.limits.maxUsers = attrs[ATTR_NUM_PIN_USERS].value
+        end
+        if attrs[ATTR_MIN_PIN_LEN] then
+          State.limits.minPin = attrs[ATTR_MIN_PIN_LEN].value
+        end
+        if attrs[ATTR_MAX_PIN_LEN] then
+          State.limits.maxPin = attrs[ATTR_MAX_PIN_LEN].value
+        end
+        if attrs[ATTR_NUM_WEEKDAY_SCHED] then
+          State.limits.weekDaySched = attrs[ATTR_NUM_WEEKDAY_SCHED].value
+        end
+        if attrs[ATTR_NUM_YEARDAY_SCHED] then
+          State.limits.yearDaySched = attrs[ATTR_NUM_YEARDAY_SCHED].value
+        end
       elseif clusterSpecific and cmd == DL_OPER_EVENT and #payload >= 2 then
         local code = payload:byte(2)
         local ls = DOORLOCK_EVENT[code]
@@ -805,8 +849,16 @@ function OnZigbeeOnlineStatusChanged(strStatus, strVersion, strSKU)
     if strVersion and strVersion ~= "" then
       UpdateProperty("Firmware Version", strVersion)
     end
-    -- Seed state from the lock (awake on join/report).
+    -- Seed state from the lock (awake on join/report): status, battery, and the
+    -- capability limits we validate user saves against.
     readAttributes(CLUSTER_DOORLOCK, { ATTR_LOCK_STATE })
+    readAttributes(CLUSTER_DOORLOCK, {
+      ATTR_NUM_PIN_USERS,
+      ATTR_NUM_WEEKDAY_SCHED,
+      ATTR_NUM_YEARDAY_SCHED,
+      ATTR_MAX_PIN_LEN,
+      ATTR_MIN_PIN_LEN,
+    })
     readAttributes(CLUSTER_POWER, { ATTR_BATT_PCT })
   else
     UpdateProperty("Firmware Version", "--")
@@ -917,6 +969,13 @@ function OnDriverLateInit()
   -- OnZigbeePacketIn recovers Online and seeds lock state + battery.
   SetTimer("InitProbe", 3 * ONE_SECOND, function()
     readAttributes(CLUSTER_DOORLOCK, { ATTR_LOCK_STATE })
+    readAttributes(CLUSTER_DOORLOCK, {
+      ATTR_NUM_PIN_USERS,
+      ATTR_NUM_WEEKDAY_SCHED,
+      ATTR_NUM_YEARDAY_SCHED,
+      ATTR_MAX_PIN_LEN,
+      ATTR_MIN_PIN_LEN,
+    })
     readAttributes(CLUSTER_POWER, { ATTR_BATT_PCT })
   end)
   --#ifndef DRIVERCENTRAL
