@@ -1,4 +1,4 @@
-# <span style="color:#0057B8">Changelog</span>
+# <span style="color:#D12231">Changelog</span>
 
 <!-- prettier-ignore-start -->
 
