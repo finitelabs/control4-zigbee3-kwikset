@@ -41,14 +41,58 @@ local ZCL_READ_ATTR = 0x00
 local ZCL_READ_ATTR_RSP = 0x01
 local ZCL_WRITE_ATTR = 0x02
 local ZCL_REPORT_ATTR = 0x0a
+local ZCL_DEFAULT_RESPONSE = 0x0b -- <cmdId:u8> <status:u8>
+local ZCL_STATUS_UNSUP_CMD = 0x81 -- UNSUP_CLUSTER_COMMAND
 
 -- DoorLock cluster-specific command ids (client -> server)
 local DL_LOCK = 0x00 -- <pin:octstr>
 local DL_UNLOCK = 0x01 -- <pin:octstr>
 local DL_SET_PIN = 0x05 -- <userId:u16> <userStatus:u8> <userType:u8> <pin:octstr>
+local DL_GET_PIN = 0x06 -- <userId:u16> (read-only; used to probe keypad support)
 local DL_CLEAR_PIN = 0x07 -- <userId:u16>
+local DL_SET_WEEKDAY_SCHED = 0x0b -- <schedId:u8> <userId:u16> <days:u8> <sH> <sM> <eH> <eM>
+local DL_CLEAR_WEEKDAY_SCHED = 0x0d -- <schedId:u8> <userId:u16>
+local DL_SET_YEARDAY_SCHED = 0x0e -- <schedId:u8> <userId:u16> <startZcl:u32> <endZcl:u32>
+local DL_CLEAR_YEARDAY_SCHED = 0x10 -- <schedId:u8> <userId:u16>
+local DL_SET_USER_TYPE = 0x14 -- <userId:u16> <userType:u8>
 -- DoorLock server -> client
 local DL_OPER_EVENT = 0x20 -- Operating Event Notification
+
+-- ZCL DoorLock user types
+local USER_TYPE_UNRESTRICTED = 0x00
+local USER_TYPE_YEARDAY = 0x01
+local USER_TYPE_WEEKDAY = 0x02
+
+-- DoorLock commands that manage user codes or schedules. A lock that rejects one
+-- of these as unsupported (0x81) has no keypad, e.g. a SmartCode Convert module
+-- fitted to a plain deadbolt. We use that to drop user management dynamically.
+local CREDENTIAL_CMDS = {
+  [DL_SET_PIN] = true,
+  [DL_GET_PIN] = true,
+  [DL_CLEAR_PIN] = true,
+  [DL_SET_WEEKDAY_SCHED] = true,
+  [DL_CLEAR_WEEKDAY_SCHED] = true,
+  [DL_SET_YEARDAY_SCHED] = true,
+  [DL_CLEAR_YEARDAY_SCHED] = true,
+  [DL_SET_USER_TYPE] = true,
+}
+
+-- LOCK proxy capabilities that only make sense on a lock with a keypad. They are
+-- turned off together when the lock proves it has none (rejects credential
+-- commands) and back on when it proves it has one, via CAPABILITY_CHANGED.
+-- max_users is pushed alongside these (0 when unsupported).
+local USER_CODE_CAPABILITIES = {
+  "can_add_remove_user",
+  "can_edit_user",
+  "can_edit_user_pin",
+  "has_daily_schedule",
+  "has_date_range_schedule",
+  "has_schedule_lockout",
+  "has_admin_code",
+}
+
+-- Seconds between the Unix epoch (1970) and the ZCL epoch (2000-01-01 UTC).
+local ZCL_EPOCH_OFFSET = 946684800
 
 -- DoorLock attributes
 local ATTR_LOCK_STATE = 0x0000 -- 0 not-fully / 1 locked / 2 unlocked
@@ -88,6 +132,9 @@ local State = {
   adminCode = "",
   logItemCount = 5,
   scheduleLockoutEnabled = false,
+  -- Assume the lock has a keypad until it rejects a user-code command. Re-probed
+  -- on every online, so a module swap is picked up on the next reload.
+  supportsUserCodes = true,
   users = {}, -- id -> { name, code, active, sched } (persisted)
   history = {}, -- array of { date, time, message, source }, newest last (persisted)
   -- Lock capability limits, read from the DoorLock cluster at online. Seeded
@@ -107,6 +154,10 @@ end
 
 local function u16le(v)
   return string.char(v % 256, math.floor(v / 256) % 256)
+end
+
+local function u32le(v)
+  return string.char(v % 256, math.floor(v / 256) % 256, math.floor(v / 65536) % 256, math.floor(v / 16777216) % 256)
 end
 
 --- Build a ZCL header. clusterSpecific = false is a global command.
@@ -260,6 +311,42 @@ local function notifySettings()
     .. xmlNode("volume", "0")
     .. xmlNode("one_touch_locking", "false")
   notify("SETTINGS", xmlWrap("lock_settings", body))
+end
+
+--- Push the capability set that matches State.supportsUserCodes to the proxy.
+--- Called on init from the persisted verdict (so a reload does not briefly
+--- re-expose user management before the sleepy lock answers a probe) and whenever
+--- the verdict changes. Lock/unlock, status, battery, auto-lock, and history are
+--- never touched.
+local function applyUserCodeCapabilities()
+  local value = State.supportsUserCodes and "true" or "false"
+  for _, name in ipairs(USER_CODE_CAPABILITIES) do
+    notify("CAPABILITY_CHANGED", { NAME = name, VALUE = value })
+  end
+  notify("CAPABILITY_CHANGED", {
+    NAME = "max_users",
+    VALUE = tostring(State.supportsUserCodes and State.limits.maxUsers or 0),
+  })
+  notify("LOCK_CAPABILITIES_CHANGED", {})
+end
+
+--- Record whether the lock supports user codes and push the matching capability
+--- set. A keypadless lock (e.g. a SmartCode Convert retrofit) rejects credential
+--- commands, which hides user codes, schedules, and the admin code; a keypad lock
+--- accepts them and gets full user management. Persisted, because these battery
+--- locks sleep and may not answer a probe until well after the driver starts.
+local function setUserCodeSupport(supported)
+  if State.supportsUserCodes == supported then
+    return
+  end
+  State.supportsUserCodes = supported
+  persist:set("supportsUserCodes", supported)
+  log:info(
+    "lock %s user codes; %s user management",
+    supported and "supports" or "does not support",
+    supported and "restoring" or "dropping"
+  )
+  applyUserCodeCapabilities()
 end
 
 -- Proxy user-schedule fields <-> stored user.sched keys. The proxy sends (and
@@ -435,6 +522,8 @@ local function loadState()
   State.logItemCount = tointeger(persist:get("logItemCount", 5)) or 5
   State.scheduleLockoutEnabled = toboolean(persist:get("scheduleLockoutEnabled", false)) or false
   State.history = persist:get("history", {}) or {}
+  -- A stored false (in any form) means "no keypad"; unknown defaults to yes.
+  State.supportsUserCodes = toboolean(persist:get("supportsUserCodes", true))
 end
 
 -- ---------------------------------------------------------------------------
@@ -537,11 +626,69 @@ local function writeUserPin(id, code)
   end
 end
 
+-- Weekday bit values; SCHEDULED_DAYS[1]=Sunday .. [7]=Saturday and the ZCL
+-- weekday DaysMask has bit0=Sunday .. bit6=Saturday.
+local WEEKDAY_BITS = { 1, 2, 4, 8, 16, 32, 64 }
+
+--- Push a user's schedule to the lock (ZCL DoorLock). A restricted user gets a
+--- weekday or yearday schedule plus the matching user type; an unrestricted user
+--- has its schedules cleared and is set back to Unrestricted. The lock enforces
+--- the window itself.
+local function writeUserSchedule(id, u)
+  log:trace("writeUserSchedule(%s)", id)
+  local s = u.sched or {}
+  if not s.restricted then
+    sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_WEEKDAY_SCHED, string.char(0) .. u16le(id))
+    sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_YEARDAY_SCHED, string.char(0) .. u16le(id))
+    sendCommand(CLUSTER_DOORLOCK, DL_SET_USER_TYPE, u16le(id) .. string.char(USER_TYPE_UNRESTRICTED))
+    return
+  end
+  if s.type == "date_range" then
+    local startT = os.time({
+      year = s.startYear or 2000,
+      month = s.startMonth or 1,
+      day = s.startDay or 1,
+      hour = math.floor((s.startTime or 0) / 60),
+      min = (s.startTime or 0) % 60,
+      sec = 0,
+    }) - ZCL_EPOCH_OFFSET
+    local endT = os.time({
+      year = s.endYear or 2000,
+      month = s.endMonth or 1,
+      day = s.endDay or 1,
+      hour = math.floor((s.endTime or 0) / 60),
+      min = (s.endTime or 0) % 60,
+      sec = 0,
+    }) - ZCL_EPOCH_OFFSET
+    sendCommand(CLUSTER_DOORLOCK, DL_SET_YEARDAY_SCHED, string.char(0) .. u16le(id) .. u32le(startT) .. u32le(endT))
+    sendCommand(CLUSTER_DOORLOCK, DL_SET_USER_TYPE, u16le(id) .. string.char(USER_TYPE_YEARDAY))
+  else
+    local days, idx = 0, 1
+    for w in tostring(s.days or ""):gmatch("[^,]+") do
+      if idx <= 7 and toboolean(w) then
+        days = days + WEEKDAY_BITS[idx]
+      end
+      idx = idx + 1
+    end
+    local st, et = s.startTime or 0, s.endTime or 1439
+    local payload = string.char(0)
+      .. u16le(id)
+      .. string.char(days, math.floor(st / 60), st % 60, math.floor(et / 60), et % 60)
+    sendCommand(CLUSTER_DOORLOCK, DL_SET_WEEKDAY_SCHED, payload)
+    sendCommand(CLUSTER_DOORLOCK, DL_SET_USER_TYPE, u16le(id) .. string.char(USER_TYPE_WEEKDAY))
+  end
+end
+
 --- Add or edit a user code. tParams carries USER_ID/USER_NAME/PASSCODE/IS_ACTIVE
 --- and optional schedule fields. The lock proxy has no reject-with-message path,
 --- so when a save would trip a lock limit we refuse it and surface the reason in
 --- the Last Action Description (notifyLockChanged), the only free-text channel.
 local function upsertUser(tParams, isEdit)
+  if not State.supportsUserCodes then
+    log:warn("ignoring user save; lock does not support user codes")
+    notifyLockChanged("This lock does not support user codes", "Control4", false)
+    return
+  end
   local id = tointeger(Select(tParams, "USER_ID"))
   if id == nil then
     for i = 1, State.limits.maxUsers do
@@ -584,6 +731,7 @@ local function upsertUser(tParams, isEdit)
   State.users[id] = u
   saveUsers()
   writeUserPin(id, u.active and u.code or nil)
+  writeUserSchedule(id, u)
   notify(isEdit and "USER_CHANGED" or "USER_ADDED", userFields(id, u))
   addHistory(string.format("%s User %d (%s)", isEdit and "Updated" or "Added", id, u.name), "Control4")
 end
@@ -812,6 +960,17 @@ function OnZigbeePacketIn(packet, profileId, clusterId, groupId, srcEndpoint, ds
         if ls then
           applyLockStatus(zclLockStatus(ls), "Operation", DOORLOCK_EVENT_SOURCE[code] or "Lock", true)
         end
+      elseif clusterSpecific and cmd == DL_GET_PIN then
+        -- The lock understood GetPINCode, so it has a keypad. Restore user
+        -- management in case this driver was moved onto a keypad lock.
+        setUserCodeSupport(true)
+      elseif not clusterSpecific and cmd == ZCL_DEFAULT_RESPONSE and #payload >= 2 then
+        local respCmd, status = payload:byte(1), payload:byte(2)
+        -- A keypadless lock rejects user-code/schedule commands as unsupported;
+        -- take that as the signal to drop user management.
+        if status == ZCL_STATUS_UNSUP_CMD and CREDENTIAL_CMDS[respCmd] then
+          setUserCodeSupport(false)
+        end
       end
     elseif
       clusterId == CLUSTER_POWER
@@ -859,6 +1018,8 @@ function OnZigbeeOnlineStatusChanged(strStatus, strVersion, strSKU)
       ATTR_MAX_PIN_LEN,
       ATTR_MIN_PIN_LEN,
     })
+    -- Probe keypad support: a keypadless lock rejects this and we drop user mgmt.
+    sendCommand(CLUSTER_DOORLOCK, DL_GET_PIN, u16le(1))
     readAttributes(CLUSTER_POWER, { ATTR_BATT_PCT })
   else
     UpdateProperty("Firmware Version", "--")
@@ -963,6 +1124,11 @@ function OnDriverLateInit()
   -- before a lock is joined.
   UpdateProperty("Driver Status", State.online and "Online" or "Offline")
   notifyLockInitialize()
+  -- Re-apply a known "no keypad" verdict from persistence right away, so a reload
+  -- does not re-expose user management until the sleepy lock answers a probe.
+  if not State.supportsUserCodes then
+    applyUserCodeCapabilities()
+  end
   -- A driver reload may not re-fire OnZigbeeOnlineStatusChanged for a lock that
   -- is already joined and online, which would leave the driver stuck Offline.
   -- Probe the lock once after init; if it is reachable it responds and
@@ -976,6 +1142,7 @@ function OnDriverLateInit()
       ATTR_MAX_PIN_LEN,
       ATTR_MIN_PIN_LEN,
     })
+    sendCommand(CLUSTER_DOORLOCK, DL_GET_PIN, u16le(1))
     readAttributes(CLUSTER_POWER, { ATTR_BATT_PCT })
   end)
   --#ifndef DRIVERCENTRAL
