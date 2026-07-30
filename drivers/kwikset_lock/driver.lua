@@ -67,14 +67,13 @@ local DL_SET_WEEKDAY_SCHED = 0x0b -- <schedId:u8> <userId:u16> <days:u8> <sH> <s
 local DL_CLEAR_WEEKDAY_SCHED = 0x0d -- <schedId:u8> <userId:u16>
 local DL_SET_YEARDAY_SCHED = 0x0e -- <schedId:u8> <userId:u16> <startZcl:u32> <endZcl:u32>
 local DL_CLEAR_YEARDAY_SCHED = 0x10 -- <schedId:u8> <userId:u16>
-local DL_SET_USER_TYPE = 0x14 -- <userId:u16> <userType:u8>
 -- DoorLock server -> client
 local DL_OPER_EVENT = 0x20 -- Operating Event Notification
 
--- ZCL DoorLock user types
-local USER_TYPE_UNRESTRICTED = 0x00
-local USER_TYPE_YEARDAY = 0x01
-local USER_TYPE_WEEKDAY = 0x02
+-- Note: no Set User Type (0x14) - Kwikset firmware rejects it (status 0x01)
+-- and derives the user type from the schedule commands themselves (verified
+-- live 2026-07-30; the native driver's Owner/Worker/Guest types are likewise
+-- schedule-implied).
 
 -- DoorLock commands that manage user codes or schedules. A lock that rejects one
 -- of these as unsupported (0x81) has no keypad, e.g. a SmartCode Convert module
@@ -87,7 +86,6 @@ local CREDENTIAL_CMDS = {
   [DL_CLEAR_WEEKDAY_SCHED] = true,
   [DL_SET_YEARDAY_SCHED] = true,
   [DL_CLEAR_YEARDAY_SCHED] = true,
-  [DL_SET_USER_TYPE] = true,
 }
 
 -- DoorLock cluster-specific responses that settle an owed write. Response ids
@@ -99,7 +97,6 @@ local DL_RESPONSE_CMDS = {
   [DL_CLEAR_WEEKDAY_SCHED] = true,
   [DL_SET_YEARDAY_SCHED] = true,
   [DL_CLEAR_YEARDAY_SCHED] = true,
-  [DL_SET_USER_TYPE] = true,
 }
 
 -- LOCK proxy capabilities that only make sense on a lock with a keypad. They are
@@ -898,20 +895,15 @@ end
 local WEEKDAY_BITS = { 1, 2, 4, 8, 16, 32, 64 }
 
 --- Push a user's schedule to the lock (ZCL DoorLock). A restricted user gets a
---- weekday or yearday schedule plus the matching user type; an unrestricted user
---- has its schedules cleared and is set back to Unrestricted. The lock enforces
---- the window itself.
+--- weekday or yearday schedule; an unrestricted user has both cleared. The lock
+--- derives the user type from the schedule itself and enforces the window on
+--- its own keypad. Each branch's final command settles the owed write.
 local function writeUserSchedule(id, u)
   log:trace("writeUserSchedule(%s)", id)
   local s = u.sched or {}
   if not s.restricted then
     sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_WEEKDAY_SCHED, string.char(0) .. u16le(id))
-    sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_YEARDAY_SCHED, string.char(0) .. u16le(id))
-    -- The trailing Set User Type is the sequence that settles the owed write.
-    markPendingSent(
-      "sched:" .. id,
-      sendCommand(CLUSTER_DOORLOCK, DL_SET_USER_TYPE, u16le(id) .. string.char(USER_TYPE_UNRESTRICTED))
-    )
+    markPendingSent("sched:" .. id, sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_YEARDAY_SCHED, string.char(0) .. u16le(id)))
     return
   end
   if s.type == "date_range" then
@@ -931,10 +923,9 @@ local function writeUserSchedule(id, u)
       min = (s.endTime or 0) % 60,
       sec = 0,
     }) - ZCL_EPOCH_OFFSET
-    sendCommand(CLUSTER_DOORLOCK, DL_SET_YEARDAY_SCHED, string.char(0) .. u16le(id) .. u32le(startT) .. u32le(endT))
     markPendingSent(
       "sched:" .. id,
-      sendCommand(CLUSTER_DOORLOCK, DL_SET_USER_TYPE, u16le(id) .. string.char(USER_TYPE_YEARDAY))
+      sendCommand(CLUSTER_DOORLOCK, DL_SET_YEARDAY_SCHED, string.char(0) .. u16le(id) .. u32le(startT) .. u32le(endT))
     )
   else
     local days, idx = 0, 1
@@ -948,11 +939,7 @@ local function writeUserSchedule(id, u)
     local payload = string.char(0)
       .. u16le(id)
       .. string.char(days, math.floor(st / 60), st % 60, math.floor(et / 60), et % 60)
-    sendCommand(CLUSTER_DOORLOCK, DL_SET_WEEKDAY_SCHED, payload)
-    markPendingSent(
-      "sched:" .. id,
-      sendCommand(CLUSTER_DOORLOCK, DL_SET_USER_TYPE, u16le(id) .. string.char(USER_TYPE_WEEKDAY))
-    )
+    markPendingSent("sched:" .. id, sendCommand(CLUSTER_DOORLOCK, DL_SET_WEEKDAY_SCHED, payload))
   end
 end
 
@@ -1178,7 +1165,10 @@ local function upsertUser(tParams, isEdit)
       return
     end
   end
-  local u = state.users[id] or {}
+  local prev = state.users[id]
+  local prevCode = prev and prev.code or nil
+  local prevActive = prev ~= nil and (prev.active and true or false) or nil
+  local u = prev or {}
   u.name = Select(tParams, "USER_NAME") or u.name or ("User " .. id)
   if not IsEmpty(code) then
     u.code = tostring(code)
@@ -1189,9 +1179,17 @@ local function upsertUser(tParams, isEdit)
   state.users[id] = u
   saveUsers()
   local msg = string.format("%s User %d (%s)", isEdit and "Updated" or "Added", id, u.name)
-  registerPending("pin:" .. id, "pin", id, msg, "user:" .. id)
+  -- The lock rejects re-writing an occupied slot with its own PIN (duplicate
+  -- check), so the PIN write only goes out when the code or active state
+  -- actually changed; the schedule is idempotent and always re-pushed.
+  local pinChanged = prevCode ~= u.code or prevActive ~= u.active
+  if pinChanged then
+    registerPending("pin:" .. id, "pin", id, msg, "user:" .. id)
+  end
   registerPending("sched:" .. id, "sched", id, msg, "user:" .. id)
-  writeUserPin(id, u.active and u.code or nil)
+  if pinChanged then
+    writeUserPin(id, u.active and u.code or nil)
+  end
   writeUserSchedule(id, u)
   notify(isEdit and "USER_CHANGED" or "USER_ADDED", userFields(id, u))
 end
@@ -1471,12 +1469,16 @@ end
 
 function EC.SYNC_USERS(tParams)
   log:trace("EC.SYNC_USERS(%s)", tParams)
-  -- Re-send every user's full intent - PIN and schedule/user type - so a replay
-  -- reconverges the lock (a PIN-only replay would reset restricted users to
-  -- Unrestricted, silently removing their access windows).
+  -- Re-send every user's full intent - PIN and schedule - so a replay
+  -- reconverges the lock. Clear each occupied slot first: the lock's
+  -- duplicate-PIN check would otherwise reject re-writing a PIN that is
+  -- already present.
   for id, u in pairs(state.users) do
     registerPending("pin:" .. id, "pin", id, nil, nil)
     registerPending("sched:" .. id, "sched", id, nil, nil)
+    if u.active and u.code then
+      sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(id))
+    end
     writeUserPin(id, u.active and u.code or nil)
     writeUserSchedule(id, u)
   end
