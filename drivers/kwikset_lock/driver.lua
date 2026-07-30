@@ -1049,16 +1049,19 @@ local function writeSettingAttr(key)
   markPendingSent(key, writeAttributes(CLUSTER_DOORLOCK, payload))
 end
 
---- Reconcile a lock-reported setting with desired state: adopt the lock's
---- value when the installer never set one here; re-assert desired when they
---- differ and nothing is owed.
+--- Reconcile a lock-reported setting: the lock is the source of truth. A
+--- change made on the device side (DIP switch, body menu, factory reset) is
+--- adopted as the new value and echoed to the proxy - verified live: the
+--- auto-lock DIP switch writes AutoRelockTime, and re-asserting a stored
+--- value silently fights the switch. Control4-side sets still write through
+--- as owed writes; while one is in flight the report is left alone.
 local function reconcileSetting(key, reported)
   local s = SETTING_ATTRS[key]
-  if s.rawGet() == nil then
+  if state.pending[key] ~= nil then
+    return
+  end
+  if s.rawGet() == nil or s.get() ~= reported then
     s.adopt(reported)
-  elseif state.pending[key] == nil and s.get() ~= reported then
-    registerPending(key, "attr", s.attr, nil, nil)
-    writeSettingAttr(key)
   end
 end
 
