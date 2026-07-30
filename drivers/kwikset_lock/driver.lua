@@ -159,6 +159,7 @@ local state = {
   seq = 0,
   srcEndpoint = 1,
   dstEndpoint = 1,
+  dstEndpointLearned = false, -- true once the DoorLock cluster itself has spoken
   lockStatus = STATUS_UNKNOWN,
   battery = nil,
   online = nil,
@@ -581,6 +582,13 @@ end
 
 local function loadState()
   log:trace("loadState()")
+  -- The lock's learned application endpoint (see OnZigbeePacketIn); without it
+  -- the first post-reload sends target the default endpoint and go unanswered.
+  local dstEndpoint = tointeger(persist:get("dstEndpoint", nil))
+  if dstEndpoint then
+    state.dstEndpoint = dstEndpoint
+    state.dstEndpointLearned = true
+  end
   state.users = persist:get("users", {}, true) or {}
   -- Lock-side settings: absent means "never configured" (adopt from the lock).
   -- persist:get(key, nil) returns an internal sentinel table for absent keys,
@@ -1496,7 +1504,22 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
   if not gInitialized then
     return
   end
-  state.dstEndpoint = srcEndpoint or state.dstEndpoint
+  -- Learn the lock's application endpoint. Any cluster's traffic is a
+  -- bootstrap guess, but only the DoorLock cluster's own endpoint is
+  -- authoritative - and it persists, because a reload otherwise resets to
+  -- endpoint 1 and the init-probe reads go unanswered until the lock happens
+  -- to speak first.
+  if srcEndpoint then
+    if clusterId == CLUSTER_DOORLOCK then
+      if srcEndpoint ~= state.dstEndpoint or not state.dstEndpointLearned then
+        state.dstEndpoint = srcEndpoint
+        state.dstEndpointLearned = true
+        persist:set("dstEndpoint", srcEndpoint)
+      end
+    elseif not state.dstEndpointLearned then
+      state.dstEndpoint = srcEndpoint
+    end
+  end
   -- Any packet from the lock proves it is reachable. Recover Online here in case
   -- a driver reload missed the one-shot OnZigbeeOnlineStatusChanged callback.
   if not state.online then
