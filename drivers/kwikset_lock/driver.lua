@@ -160,6 +160,8 @@ local state = {
   lockStatus = STATUS_UNKNOWN,
   battery = nil,
   online = nil,
+  cmdSentAt = 0, -- os.time() of the last RF lock/unlock, for the jam debounce
+  faultRecheck = false, -- one silent re-poll consumed for a mid-throw "fault"
   -- Lock-side config settings. nil = never configured here: the first value the
   -- lock reports is adopted as desired; once set from Control4, desired wins
   -- and drift on the lock is re-asserted.
@@ -834,12 +836,16 @@ end
 
 local function lock()
   log:trace("lock()")
+  state.cmdSentAt = os.time()
+  state.faultRecheck = false
   sendCommand(CLUSTER_DOORLOCK, DL_LOCK, octstr(state.adminCode))
   pollLockState()
 end
 
 local function unlock()
   log:trace("unlock()")
+  state.cmdSentAt = os.time()
+  state.faultRecheck = false
   sendCommand(CLUSTER_DOORLOCK, DL_UNLOCK, octstr(state.adminCode))
   pollLockState()
 end
@@ -1546,8 +1552,24 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
     elseif clusterId == CLUSTER_DOORLOCK then
       if not clusterSpecific and (cmd == ZCL_REPORT_ATTR or cmd == ZCL_READ_ATTR_RSP) then
         local attrs = decodeAttributes(payload, cmd)
-        if attrs[ATTR_LOCK_STATE] and attrs[ATTR_LOCK_STATE].value then
-          applyLockStatus(zclLockStatus(attrs[ATTR_LOCK_STATE].value), "Status", "Control4", false)
+        if attrs[ATTR_LOCK_STATE] and attrs[ATTR_LOCK_STATE].value ~= nil then
+          local ls = zclLockStatus(attrs[ATTR_LOCK_STATE].value)
+          -- A verify poll can land while the bolt is still moving, which reads
+          -- as "not fully locked". Within the post-command window, give that
+          -- one silent re-check instead of surfacing a transient Jam (seen
+          -- live: unlock -> 1.5s poll -> Jammed -> Unlocked a second later).
+          if
+            ls == STATUS_FAULT
+            and state.lockStatus ~= STATUS_FAULT
+            and os.time() - (state.cmdSentAt or 0) <= 6
+            and not state.faultRecheck
+          then
+            state.faultRecheck = true
+            pollLockState()
+          else
+            state.faultRecheck = false
+            applyLockStatus(ls, "Status", "Control4", false)
+          end
         end
         -- Capability limits reported by the lock; use them for validation.
         if attrs[ATTR_NUM_PIN_USERS] and attrs[ATTR_NUM_PIN_USERS].value then
