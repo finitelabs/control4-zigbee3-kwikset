@@ -55,6 +55,7 @@ local ZCL_WRITE_ATTR_RSP = 0x04 -- <status:u8> [...]
 local ZCL_REPORT_ATTR = 0x0a
 local ZCL_DEFAULT_RESPONSE = 0x0b -- <cmdId:u8> <status:u8>
 local ZCL_STATUS_UNSUP_CMD = 0x81 -- UNSUP_CLUSTER_COMMAND
+local ZCL_STATUS_UNSUP_ATTR = 0x86 -- UNSUPPORTED_ATTRIBUTE
 
 -- DoorLock cluster-specific command ids (client -> server)
 local DL_LOCK = 0x00 -- <pin:octstr>
@@ -179,6 +180,10 @@ local state = {
   history = {}, -- array of { date, time, message, source }, newest last (persisted)
   pending = {}, -- owed lock writes: key -> { kind, id, msg, group, attempts, ts } (persisted)
   pendingSeq = {}, -- ZCL seq -> pending key (transient; rebuilt as sends go out)
+  -- Per-setting support verdicts learned from the lock's per-attribute ZCL
+  -- statuses; absent = assumed supported (per driver.xml). false hides the
+  -- setting via CAPABILITY_CHANGED. (persisted)
+  settingSupport = {},
   -- Lock capability limits, read from the DoorLock cluster at online. Seeded
   -- with the SmartCode Convert's known values so validation works before the
   -- lock reports.
@@ -270,30 +275,36 @@ local TYPE_FMT = {
 }
 local UNSIGNED8 = { [0x10] = true, [0x18] = true, [0x20] = true, [0x30] = true }
 
+--- Decode attribute records into { [attrId] = { status, type, value } }. A Read
+--- Attributes Response carries a per-attribute status; a failed record (e.g.
+--- UNSUPPORTED_ATTRIBUTE) has no type/value but must not stop the parse - the
+--- records behind it in the same response are still good. value is nil for
+--- failed records, so consumers check it, not just the attribute's presence.
 local function decodeAttributes(payload, cmdId)
   local attrs, pos, n = {}, 1, #payload
   while pos + 2 <= n + 1 do
     local attrId
     pos, attrId = string.unpack(payload, "<H", pos)
+    local status = 0
     if cmdId == ZCL_READ_ATTR_RSP then
-      local status
       pos, status = u8(payload, pos)
-      if status ~= 0 then
-        break
+    end
+    if status ~= 0 then
+      attrs[attrId] = { status = status }
+    else
+      local dtype
+      pos, dtype = u8(payload, pos)
+      local fmt = TYPE_FMT[dtype]
+      if not fmt then
+        break -- unknown type: record length unknowable, cannot continue safely
       end
+      local np, v = string.unpack(payload, fmt, pos)
+      if UNSIGNED8[dtype] and v < 0 then
+        v = v + 256
+      end
+      attrs[attrId] = { status = 0, type = dtype, value = v }
+      pos = np
     end
-    local dtype
-    pos, dtype = u8(payload, pos)
-    local fmt = TYPE_FMT[dtype]
-    if not fmt then
-      break
-    end
-    local np, v = string.unpack(payload, fmt, pos)
-    if UNSIGNED8[dtype] and v < 0 then
-      v = v + 256
-    end
-    attrs[attrId] = { type = dtype, value = v }
-    pos = np
   end
   return attrs
 end
@@ -604,6 +615,7 @@ local function loadState()
   -- Writes owed to the lock from a previous run; re-armed (not re-sent) in
   -- OnDriverLateInit and flushed when the lock next speaks.
   state.pending = persist:get("pendingWrites", {}) or {}
+  state.settingSupport = persist:get("settingSupport", {}) or {}
   -- A stored false (in any form) means "no keypad"; unknown defaults to yes.
   state.supportsUserCodes = toboolean(persist:get("supportsUserCodes", true))
 end
@@ -959,6 +971,7 @@ end
 local SETTING_ATTRS = {
   ["attr:autolock"] = {
     attr = ATTR_AUTO_RELOCK,
+    cap = "has_auto_lock_time",
     type = 0x23, -- u32
     rawGet = function()
       return state.autoLockSeconds
@@ -974,6 +987,7 @@ local SETTING_ATTRS = {
   },
   ["attr:volume"] = {
     attr = ATTR_SOUND_VOLUME,
+    cap = "has_volume",
     type = 0x20, -- u8
     rawGet = function()
       return state.volume
@@ -989,6 +1003,7 @@ local SETTING_ATTRS = {
   },
   ["attr:onetouch"] = {
     attr = ATTR_ONE_TOUCH_LOCKING,
+    cap = "has_one_touch_locking",
     type = 0x10, -- bool
     rawGet = function()
       return state.oneTouchLocking
@@ -1008,6 +1023,7 @@ local SETTING_ATTRS = {
   },
   ["attr:wrongcode"] = {
     attr = ATTR_WRONG_CODE_LIMIT,
+    cap = "has_wrong_code_attempts",
     type = 0x20, -- u8
     rawGet = function()
       return state.wrongCodeAttempts
@@ -1023,6 +1039,7 @@ local SETTING_ATTRS = {
   },
   ["attr:shutout"] = {
     attr = ATTR_SHUTOUT_TIME,
+    cap = "has_shutout_timer",
     type = 0x20, -- u8
     rawGet = function()
       return state.shutoutTimer
@@ -1064,6 +1081,40 @@ local function reconcileSetting(key, reported)
     registerPending(key, "attr", s.attr, nil, nil)
     writeSettingAttr(key)
   end
+end
+
+--- Record whether the lock supports a ZCL-backed setting and show/hide its
+--- control via the proxy's capability channel (the proxy persists capability
+--- values, so verdicts are pushed on change and replayed on request). An
+--- unsupported setting also drops any owed write - it can never confirm.
+local function setSettingSupport(key, supported)
+  if state.settingSupport[key] == supported then
+    return
+  end
+  state.settingSupport[key] = supported
+  persist:set("settingSupport", state.settingSupport)
+  local s = SETTING_ATTRS[key]
+  log:info(
+    "Lock %s %s; %s its setting",
+    supported and "supports" or "does not support",
+    s.cap,
+    supported and "showing" or "hiding"
+  )
+  notify("CAPABILITY_CHANGED", { NAME = s.cap, VALUE = supported and "true" or "false" })
+  notify("LOCK_CAPABILITIES_CHANGED", {})
+  if not supported then
+    cancelPending(key)
+  end
+end
+
+--- Replay every ZCL-backed setting's capability verdict to the proxy
+--- (unknown counts as supported, matching the driver.xml defaults).
+local function applySettingCapabilities()
+  for key, s in pairs(SETTING_ATTRS) do
+    local supported = state.settingSupport[key] ~= false
+    notify("CAPABILITY_CHANGED", { NAME = s.cap, VALUE = supported and "true" or "false" })
+  end
+  notify("LOCK_CAPABILITIES_CHANGED", {})
 end
 
 --- Re-send an owed write's absolute intent, re-derived from current state so a
@@ -1183,7 +1234,14 @@ end
 
 function RFP.REQUEST_CAPABILITIES(idBinding, strCommand)
   log:trace("RFP.REQUEST_CAPABILITIES(%s, %s)", idBinding, strCommand)
-  -- Static capabilities are declared in driver.xml; nothing dynamic to send.
+  if idBinding ~= PROXY_BINDING then
+    return
+  end
+  -- The proxy persists capability values, so a re-request must see current
+  -- truth: replay both dynamic sets (user-code support and per-setting
+  -- support), mirroring the native drivers' capability replay.
+  applyUserCodeCapabilities()
+  applySettingCapabilities()
 end
 
 function RFP.REQUEST_SETTINGS(idBinding, strCommand)
@@ -1476,33 +1534,51 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
     elseif clusterId == CLUSTER_DOORLOCK then
       if not clusterSpecific and (cmd == ZCL_REPORT_ATTR or cmd == ZCL_READ_ATTR_RSP) then
         local attrs = decodeAttributes(payload, cmd)
-        if attrs[ATTR_LOCK_STATE] then
+        if attrs[ATTR_LOCK_STATE] and attrs[ATTR_LOCK_STATE].value then
           applyLockStatus(zclLockStatus(attrs[ATTR_LOCK_STATE].value), "Status", "Control4", false)
         end
         -- Capability limits reported by the lock; use them for validation.
-        if attrs[ATTR_NUM_PIN_USERS] then
+        if attrs[ATTR_NUM_PIN_USERS] and attrs[ATTR_NUM_PIN_USERS].value then
           state.limits.maxUsers = attrs[ATTR_NUM_PIN_USERS].value
         end
-        if attrs[ATTR_MIN_PIN_LEN] then
+        if attrs[ATTR_MIN_PIN_LEN] and attrs[ATTR_MIN_PIN_LEN].value then
           state.limits.minPin = attrs[ATTR_MIN_PIN_LEN].value
         end
-        if attrs[ATTR_MAX_PIN_LEN] then
+        if attrs[ATTR_MAX_PIN_LEN] and attrs[ATTR_MAX_PIN_LEN].value then
           state.limits.maxPin = attrs[ATTR_MAX_PIN_LEN].value
         end
-        if attrs[ATTR_NUM_WEEKDAY_SCHED] then
+        if attrs[ATTR_NUM_WEEKDAY_SCHED] and attrs[ATTR_NUM_WEEKDAY_SCHED].value then
           state.limits.weekDaySched = attrs[ATTR_NUM_WEEKDAY_SCHED].value
         end
-        if attrs[ATTR_NUM_YEARDAY_SCHED] then
+        if attrs[ATTR_NUM_YEARDAY_SCHED] and attrs[ATTR_NUM_YEARDAY_SCHED].value then
           state.limits.yearDaySched = attrs[ATTR_NUM_YEARDAY_SCHED].value
         end
-        -- ZCL-backed settings: adopt on first sight, re-assert desired on drift.
+        -- ZCL-backed settings: the per-attribute status decides support (and
+        -- shows/hides the control); good values adopt or re-assert desired.
         for key, s in pairs(SETTING_ATTRS) do
-          if attrs[s.attr] then
-            reconcileSetting(key, attrs[s.attr].value)
+          local rec = attrs[s.attr]
+          if rec then
+            if rec.status == ZCL_STATUS_UNSUP_ATTR then
+              setSettingSupport(key, false)
+            elseif rec.value ~= nil then
+              setSettingSupport(key, true)
+              reconcileSetting(key, rec.value)
+            end
           end
         end
       elseif not clusterSpecific and cmd == ZCL_WRITE_ATTR_RSP and #payload >= 1 then
-        confirmSeq(seq, payload:byte(1))
+        local status = payload:byte(1)
+        -- A failed write response carries {status, attrId} records; an
+        -- unsupported attribute hides its setting instead of raising an error.
+        if status == ZCL_STATUS_UNSUP_ATTR and #payload >= 3 then
+          local attrId = payload:byte(2) + payload:byte(3) * 256
+          for key, s in pairs(SETTING_ATTRS) do
+            if s.attr == attrId then
+              setSettingSupport(key, false)
+            end
+          end
+        end
+        confirmSeq(seq, status)
       elseif clusterSpecific and cmd == DL_OPER_EVENT and #payload >= 2 then
         local code = payload:byte(2)
         local ls = DOORLOCK_EVENT[code]
@@ -1535,7 +1611,7 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
       and (cmd == ZCL_REPORT_ATTR or cmd == ZCL_READ_ATTR_RSP)
     then
       local attrs = decodeAttributes(payload, cmd)
-      if attrs[ATTR_BATT_PCT] then
+      if attrs[ATTR_BATT_PCT] and attrs[ATTR_BATT_PCT].value then
         local pct = math.floor(attrs[ATTR_BATT_PCT].value / 2 + 0.5)
         local prev = state.battery
         state.battery = pct
@@ -1758,6 +1834,10 @@ function OnDriverLateInit()
   -- does not re-expose user management until the sleepy lock answers a probe.
   if not state.supportsUserCodes then
     applyUserCodeCapabilities()
+  end
+  -- Same for learned per-setting support verdicts.
+  if next(state.settingSupport) ~= nil then
+    applySettingCapabilities()
   end
   -- Writes owed from before the reload: re-arm the retry window but don't blast
   -- the sleeping lock now - its next inbound packet flushes them.
