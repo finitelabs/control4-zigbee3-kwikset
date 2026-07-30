@@ -579,28 +579,8 @@ local function saveUsers()
   persist:set("users", state.users, true)
 end
 
---- One-shot migration: user PINs and the admin code moved to encrypted
---- persistence. Read the legacy plaintext values once, re-store them encrypted
---- under the same keys, and stamp a schema version so this never runs again.
---- A fresh install has nothing stored and skips straight to the stamp.
-local function migrateSecrets()
-  if (tointeger(persist:get("persistVersion", 1)) or 1) >= 2 then
-    return
-  end
-  local users = persist:get("users", nil)
-  if users ~= nil then
-    persist:set("users", users, true)
-  end
-  local adminCode = persist:get("adminCode", nil)
-  if adminCode ~= nil then
-    persist:set("adminCode", adminCode, true)
-  end
-  persist:set("persistVersion", 2)
-end
-
 local function loadState()
   log:trace("loadState()")
-  migrateSecrets()
   state.users = persist:get("users", {}, true) or {}
   -- Lock-side settings: absent means "never configured" (adopt from the lock).
   -- persist:get(key, nil) returns an internal sentinel table for absent keys,
