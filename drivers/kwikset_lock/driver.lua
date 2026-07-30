@@ -603,9 +603,13 @@ local function loadState()
   migrateSecrets()
   state.users = persist:get("users", {}, true) or {}
   -- Lock-side settings: absent means "never configured" (adopt from the lock).
+  -- persist:get(key, nil) returns an internal sentinel table for absent keys,
+  -- so every load type-checks its value to keep "never configured" nil.
   state.autoLockSeconds = tonumber(persist:get("autoLockSeconds", nil))
-  state.volume = persist:get("volume", nil)
-  state.oneTouchLocking = persist:get("oneTouchLocking", nil)
+  local volume = persist:get("volume", nil)
+  state.volume = type(volume) == "string" and volume or nil
+  local oneTouch = persist:get("oneTouchLocking", nil)
+  state.oneTouchLocking = type(oneTouch) == "boolean" and oneTouch or nil
   state.wrongCodeAttempts = tointeger(persist:get("wrongCodeAttempts", nil))
   state.shutoutTimer = tointeger(persist:get("shutoutTimer", nil))
   state.adminCode = persist:get("adminCode", "", true) or ""
