@@ -26,7 +26,66 @@
        Basic ManufacturerName (0x0004) + ModelIdentifier (0x0005) against these
        keys. -->
   <binding_keys version="2">
-    <!-- #embed generated/binding_keys.xml -->
+    <!-- Kwikset 66492-001 (Home Connect conversion kit, Gen1) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE_CONVERT_GEN1</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <!-- Kwikset 99140-139 (SmartCode conversion kit, Zigbee 3) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE_CONVERT_GEN1_W3</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <!-- Kwikset 99140-031 (SmartCode 10 Touch, Zigbee 3) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE_DEADBOLT_10T_W3</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <!-- Kwikset 99140-002 (SmartCode 10 deadbolt) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE_DEADBOLT_10_L</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <!-- Kwikset 99140-031 (SmartCode 10 deadbolt, Zigbee 3) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE_DEADBOLT_10_W3</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <!-- Kwikset 99140-031 (SmartCode 10 deadbolt, Zigbee 3, lever) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE_DEADBOLT_10_W3_L</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <!-- Kwikset 99100-045 (SmartCode 5 deadbolt) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE_DEADBOLT_5</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <!-- Kwikset 99100-006 (SmartCode 5 deadbolt) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE_DEADBOLT_5_L</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <!-- Kwikset 99120-021 (SmartCode 5 lever) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE_LEVER_5</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <!-- Kwikset 66492-001 (Home Connect conversion kit) -->
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>Smartcode</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
   </binding_keys>
 
   <capabilities>
@@ -43,11 +102,14 @@
     <has_lock_modes>false</has_lock_modes>
     <lock_modes_values>normal</lock_modes_values>
     <has_log_failed_attempts>false</has_log_failed_attempts>
-    <has_wrong_code_attempts>false</has_wrong_code_attempts>
-    <has_shutout_timer>false</has_shutout_timer>
+    <has_wrong_code_attempts>true</has_wrong_code_attempts>
+    <wrong_code_attempts_values>1, 2, 3, 4, 5, 6, 7</wrong_code_attempts_values>
+    <has_shutout_timer>true</has_shutout_timer>
+    <shutout_timer_values>5, 10, 30, 60, 120</shutout_timer_values>
+    <shutout_timer_display_values>5sec, 10sec, 30sec, 1min, 2min</shutout_timer_display_values>
     <has_language>false</has_language>
-    <has_volume>false</has_volume>
-    <has_one_touch_locking>false</has_one_touch_locking>
+    <has_volume>true</has_volume>
+    <has_one_touch_locking>true</has_one_touch_locking>
     <has_daily_schedule>true</has_daily_schedule>
     <has_date_range_schedule>true</has_date_range_schedule>
     <max_users>30</max_users>
@@ -114,7 +176,7 @@
       <!-- #ifndef DRIVERCENTRAL -->
       <action>
         <name>Update Drivers</name>
-        <command>Update Drivers</command>
+        <command>Update_Drivers</command>
       </action>
       <!-- #endif -->
     </actions>
