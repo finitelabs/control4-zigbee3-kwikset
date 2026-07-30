@@ -61,8 +61,6 @@ the standard Control4 lock interface.
 
 </div>
 
-<div style="page-break-after: always"></div>
-
 # <span style="color:#D12231">System Requirements</span>
 
 - Control4 OS 4.2.0 or later
@@ -77,13 +75,11 @@ the standard Control4 lock interface.
 - Speaks Zigbee 3.0 ZCL DoorLock directly to the lock - no hub, bridge, or cloud
 - Manual, keypad, and key operation reflected back as the lock's status
 - User code management for up to 30 users, each with an optional schedule
-- Administrator code, auto-lock interval, and history size configured from the
-  lock interface
+- Administrator code, auto-lock interval, keypad volume, one-touch locking,
+  wrong-code lockout, and history size configured from the lock interface
 - Event history of lock, unlock, and user-code changes
 - Battery level reporting, with a low-battery event for programming
 - Locked, Unlocked, Jammed, and Battery Low events for programming
-
-<div style="page-break-after: always"></div>
 
 # <span style="color:#D12231">Compatibility</span>
 
@@ -103,8 +99,6 @@ Other Kwikset SmartCode models with a Zigbee 3.0 radio are expected to work. If
 you have a model that is not listed, please
 [open an issue](https://github.com/finitelabs/control4-zigbee3-kwikset/issues/new)
 so it can be added.
-
-<div style="page-break-after: always"></div>
 
 # <span style="color:#D12231">Installer Setup</span>
 
@@ -179,8 +173,6 @@ the controller's Zigbee 3.0 network:
 > respond immediately after a command, operate the keypad once to wake it and
 > the status will reconcile.
 
-<div style="page-break-after: always"></div>
-
 ## Driver Setup
 
 ### Driver Properties
@@ -214,7 +206,9 @@ releases.
 
 ##### Driver Status (read-only)
 
-Displays the current state of the driver - for example _Online_ or _Offline_.
+Displays the current state of the driver - for example _Online_, _Offline_, or
+_Applying lock changes..._ while a saved change is still waiting on the lock to
+confirm it.
 
 ##### Driver Version (read-only)
 
@@ -244,10 +238,22 @@ driver's Properties tab:
 - **Auto Lock** - the delay before the lock relocks itself, selectable from
   `OFF`, `15 sec`, `30 sec`, `1 min`, `2 min`, `3 min`, `5 min`, `10 min`,
   `20 min`, and `30 min`.
+- **Keypad Volume** - the keypad beeper level (`silent`, `low`, or `high`).
+- **One Touch Locking** - whether pressing the keypad's lock button locks the
+  door without a code.
+- **Wrong Code Attempts** - how many wrong codes (`1`-`7`) the keypad accepts
+  before it temporarily disables itself.
+- **Shutout Timer** - how long the keypad stays disabled after too many wrong
+  codes (`5 sec` to `2 min`).
 - **History Size** - the number of history entries retained (`5`, `10`, `20`, or
   `50`).
 - **History** - a log of recent lock, unlock, and user-code changes, each with a
   timestamp and source.
+
+> Settings are written to the lock itself and confirmed by it. Until the lock (a
+> sleepy battery device) acknowledges a change, the driver reports _Applying
+> lock changes..._; on first join the driver adopts the lock's current settings
+> rather than overwriting them.
 
 ### Driver Actions
 
@@ -265,13 +271,13 @@ Locks the lock if it is unlocked, and unlocks it if it is locked.
 
 #### Sync Users
 
-Re-sends every stored user code to the lock. Use this if the lock was reset or
-you suspect its codes are out of sync with the project.
+Re-sends every stored user code and schedule to the lock. Use this if the lock
+was reset or you suspect its codes are out of sync with the project.
 
 #### Get Battery Status
 
-Requests the lock's current battery level and updates the `Battery Status`
-property.
+Requests the lock's current battery level and refreshes the battery status shown
+on the lock's Status panel.
 
 <!-- #ifndef DRIVERCENTRAL -->
 
@@ -294,8 +300,6 @@ lock functionality to Control4.
 The Zigbee 3.0 network connection to the controller. It is bound automatically
 when the lock is joined.
 
-<div style="page-break-after: always"></div>
-
 # <span style="color:#D12231">Programming</span>
 
 ## Events
@@ -306,8 +310,6 @@ when the lock is joined.
 | Unlocked    | Fires when the lock is unlocked             |
 | Jammed      | Fires when the lock fails to lock or unlock |
 | Battery Low | Fires when the lock reports a low battery   |
-
-<div style="page-break-after: always"></div>
 
 <!-- #ifdef DRIVERCENTRAL -->
 
@@ -349,7 +351,5 @@ https://github.com/finitelabs/control4-zigbee3-kwikset/issues/new
 <a href="https://www.buymeacoffee.com/derek.miller" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
 
 <!-- #endif -->
-
-<div style="page-break-after: always"></div>
 
 <!-- #embed-changelog -->

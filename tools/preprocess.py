@@ -67,12 +67,6 @@ def process_file(
     # inside the changelog are handled by the main processing loop.
     changelog_pattern = re.compile(r"^\s*<!--\s*#embed-changelog\s*-->\s*$")
 
-    # Generic embed pattern — inlines an arbitrary file (path relative to the
-    # file being processed) in the same pre-pass. Used to splice generated
-    # fragments (e.g. binding_keys) into a hand-authored driver.xml. XML,
-    # Lua, and slash comment styles are accepted.
-    embed_pattern = re.compile(r"^\s*(?:<!--|--|//)\s*#embed\s+(\S+)\s*(?:-->)?\s*$")
-
     # Variant filenames pattern (Lua comment style)
     variant_filenames_pattern = re.compile(r"^(\s*)--\s*#variant-filenames\s+(\w+)\s*$")
 
@@ -106,7 +100,6 @@ def process_file(
     # main loop below (no duplicated ifdef/ifndef logic needed).
     expanded_lines = []
     for line in lines:
-        embed_match = embed_pattern.match(line)
         if changelog_pattern.match(line):
             try:
                 changelog_path = Path(__file__).parent.parent / "CHANGELOG.md"
@@ -114,17 +107,6 @@ def process_file(
                     expanded_lines.extend(cf.readlines())
             except Exception as e:
                 print(f"Error embedding changelog in {file_path}: {e}")
-        elif embed_match:
-            embed_rel = embed_match.group(1)
-            embed_path = file_path.parent / embed_rel
-            try:
-                with open(embed_path, "r", encoding="utf-8") as ef:
-                    embedded = ef.readlines()
-                    if embedded and not embedded[-1].endswith("\n"):
-                        embedded[-1] += "\n"
-                    expanded_lines.extend(embedded)
-            except Exception as e:
-                print(f"Error embedding {embed_rel} in {file_path}: {e}")
         else:
             expanded_lines.append(line)
     lines = expanded_lines
