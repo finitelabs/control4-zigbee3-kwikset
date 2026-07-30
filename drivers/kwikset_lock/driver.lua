@@ -649,6 +649,31 @@ local function updateDriverStatus()
   end
 end
 
+-- Physical actions (keypad, thumbturn) push nothing on this platform: zserver
+-- rejects driver-sent ZDO Bind requests outright, the module sends no
+-- unsolicited frames on lock activity, and its accepted Configure Reporting
+-- cannot deliver without a binding-table entry (all verified live 2026-07-30).
+-- Until a Director-side binding exists, a modest LockState poll is the only
+-- honest way to see physical operations; the module already polls its parent
+-- every few seconds, so this is negligible battery-wise. Deliberate deviation
+-- from the event-driven polling convention - the hardware offers no events.
+local STATE_POLL_INTERVAL = 30 * ONE_SECOND
+local BATTERY_POLL_INTERVAL = ONE_HOUR
+
+local function startStatePolling()
+  SetTimer("StatePoll", STATE_POLL_INTERVAL, function()
+    readAttributes(CLUSTER_DOORLOCK, { ATTR_LOCK_STATE })
+  end, true)
+  SetTimer("BatteryPoll", BATTERY_POLL_INTERVAL, function()
+    readAttributes(CLUSTER_POWER, { ATTR_BATT_PCT })
+  end, true)
+end
+
+local function stopStatePolling()
+  CancelTimer("StatePoll")
+  CancelTimer("BatteryPoll")
+end
+
 --- Update online state, Driver Status, and the proxy's ONLINE_CHANGED notify.
 local function applyOnline(online)
   local changed = state.online ~= online
@@ -656,6 +681,11 @@ local function applyOnline(online)
   updateDriverStatus()
   if changed then
     notify("ONLINE_CHANGED", { STATE = online and true or false })
+    if online then
+      startStatePolling()
+    else
+      stopStatePolling()
+    end
   end
 end
 
