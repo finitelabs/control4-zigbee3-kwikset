@@ -1,12 +1,11 @@
 # Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
-_commit: v0.9.14
+_commit: v0.9.15
 _src_path: git@github.com:finitelabs/control4-driver-template.git
 distributions: drivercentral oss
 github_org: finitelabs
-lib_modules: bindings conditionals events http lru persist values
 primary_color: '#D12231'
 project_description: Zigbee 3.0 Kwikset SmartCode lock driver for Control4
 project_name: control4-zigbee3-kwikset
 readme_build: oss
 readme_driver_slug: kwikset_lock
-vendor_modules: json deferred drivers-common-public xml
+vendor_modules: ''
