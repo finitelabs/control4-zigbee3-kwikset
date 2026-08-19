@@ -1,0 +1,5 @@
+/dist
+/build
+/.venv
+/.lua
+**/http-client.private.env.json

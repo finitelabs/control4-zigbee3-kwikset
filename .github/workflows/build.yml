@@ -1,0 +1,104 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v12
+        with:
+          luaVersion: 'luajit-2.1'
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Setup stylua
+        uses: JohnnyMorganz/stylua-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: latest
+          args: --version
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxml2-dev \
+            libxslt-dev \
+            libssl-dev \
+            swig \
+            libpango-1.0-0 \
+            libpangocairo-1.0-0 \
+            libcairo2 \
+            libgdk-pixbuf-2.0-0 \
+            libffi-dev \
+            fonts-dejavu-core \
+            fonts-liberation \
+            fonts-noto-core \
+            fonts-symbola
+
+      - name: Initialize project
+        run: make init
+
+      - name: Check formatting
+        run: make check
+
+      - name: Test
+        run: make test
+
+      - name: Build
+        run: make build
+
+      - name: Verify PDFs were generated
+        run: |
+          for build in drivercentral oss; do
+            pdf_count=$(find "dist/$build/docs" -name '*.pdf' 2>/dev/null | wc -l)
+            if [ "$pdf_count" -eq 0 ]; then
+              echo "::error::No PDF files found in dist/$build/docs"
+              ls -la "dist/$build/docs/" || true
+              exit 1
+            fi
+            echo "Found $pdf_count PDF(s) in dist/$build/docs"
+          done
+
+      - name: Check for dirty tree
+        run: |
+          git diff --exit-code || { echo "::error::Uncommitted changes after build"; exit 1; }
+          UNTRACKED=$(git ls-files --others --exclude-standard)
+          if [ -n "$UNTRACKED" ]; then
+            echo "::error::Untracked files after build:"
+            echo "$UNTRACKED"
+            exit 1
+          fi
+
+
+      - name: Upload drivercentral artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: drivercentral
+          path: dist/drivercentral/*
+          if-no-files-found: error
+
+
+      - name: Upload oss artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oss
+          path: dist/oss/*
+          if-no-files-found: error
+
