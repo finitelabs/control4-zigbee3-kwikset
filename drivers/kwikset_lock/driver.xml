@@ -1,0 +1,262 @@
+<devicedata>
+  <copyright>Copyright 2026 Finite Labs, LLC. All rights reserved.</copyright>
+  <name>Kwikset SmartCode (Zigbee 3)</name>
+  <manufacturer>Kwikset</manufacturer>
+  <model>Kwikset SmartCode</model>
+  <creator>Derek Miller</creator>
+  <small image_source="c4z">icons/device_sm.png</small>
+  <large image_source="c4z">icons/device_lg.png</large>
+  <control>lua_gen</control>
+  <controlmethod>zigbee</controlmethod>
+  <driver>DriverWorks</driver>
+  <version/>
+  <created>07/20/2026 12:00:00 PM</created>
+  <modified/>
+  <minimum_os_version>4.2.0</minimum_os_version>
+  <composer_categories>
+    <category>Locks</category>
+  </composer_categories>
+
+  <!-- Presents the Control4 LOCK proxy over the ZIGBEE transport, speaking ZCL
+       DoorLock (0x0101) to a Zigbee 3.0 Kwikset SmartCode lock. -->
+
+  <!-- Kwikset SmartCode Zigbee locks report a "SMARTCODE_*" model identifier
+       (deadbolt, lever, touchscreen, and Home Connect conversion variants); a
+       few early units report "Smartcode". Matched loosely so new SmartCode
+       models bind without a driver update. -->
+  <binding_keys version="2">
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>SMARTCODE*</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+    <key>
+      <ManufacturerName>*</ManufacturerName>
+      <ModelIdentifier>Smartcode</ModelIdentifier>
+      <HWVersion>*</HWVersion>
+    </key>
+  </binding_keys>
+
+  <capabilities>
+    <zigbee3>True</zigbee3>
+    <!-- LOCK proxy feature flags. -->
+    <is_management_only>false</is_management_only>
+    <has_admin_code>true</has_admin_code>
+    <has_schedule_lockout>true</has_schedule_lockout>
+    <has_auto_lock_time>true</has_auto_lock_time>
+    <auto_lock_time_values>0, 15, 30, 60, 120, 180, 300, 600, 1200, 1800</auto_lock_time_values>
+    <auto_lock_time_display_values>OFF,15 sec,30 sec,1 min,2 min,3 min,5 min,10 min,20 min,30 min</auto_lock_time_display_values>
+    <has_log_items_count>true</has_log_items_count>
+    <log_item_count_values>5, 10, 20, 50</log_item_count_values>
+    <has_lock_modes>false</has_lock_modes>
+    <lock_modes_values>normal</lock_modes_values>
+    <has_log_failed_attempts>false</has_log_failed_attempts>
+    <has_wrong_code_attempts>true</has_wrong_code_attempts>
+    <wrong_code_attempts_values>1, 2, 3, 4, 5, 6, 7</wrong_code_attempts_values>
+    <has_shutout_timer>true</has_shutout_timer>
+    <shutout_timer_values>5, 10, 30, 60, 120</shutout_timer_values>
+    <shutout_timer_display_values>5 sec,10 sec,30 sec,1 min,2 min</shutout_timer_display_values>
+    <has_language>false</has_language>
+    <has_volume>true</has_volume>
+    <has_one_touch_locking>true</has_one_touch_locking>
+    <has_daily_schedule>true</has_daily_schedule>
+    <has_date_range_schedule>true</has_date_range_schedule>
+    <max_users>30</max_users>
+    <has_settings>true</has_settings>
+    <has_custom_settings>false</has_custom_settings>
+    <has_internal_history>true</has_internal_history>
+    <can_edit_user>true</can_edit_user>
+    <can_edit_user_pin>true</can_edit_user_pin>
+    <can_add_remove_user>true</can_add_remove_user>
+  </capabilities>
+
+  <proxies qty="1">
+    <proxy proxybindingid="5001" primary="True" name="Kwikset SmartCode">lock</proxy>
+  </proxies>
+
+  <events>
+    <event>
+      <id>1</id>
+      <name>Locked</name>
+      <description>When NAME is locked</description>
+    </event>
+    <event>
+      <id>2</id>
+      <name>Unlocked</name>
+      <description>When NAME is unlocked</description>
+    </event>
+    <event>
+      <id>3</id>
+      <name>Jammed</name>
+      <description>When NAME fails to lock or unlock</description>
+    </event>
+    <event>
+      <id>4</id>
+      <name>Battery Low</name>
+      <description>When NAME reports a low battery</description>
+    </event>
+  </events>
+
+  <config>
+    <identify_text>Put the Kwikset lock into Zigbee pairing mode (see the lock's manual), then join it to the controller's Zigbee 3.0 network.</identify_text>
+    <documentation file="www/documentation/index.html"/>
+    <script file="driver.lua" jit="1"/>
+    <actions>
+      <action>
+        <name>Lock</name>
+        <command>LOCK</command>
+      </action>
+      <action>
+        <name>Unlock</name>
+        <command>UNLOCK</command>
+      </action>
+      <action>
+        <name>Toggle</name>
+        <command>TOGGLE</command>
+      </action>
+      <action>
+        <name>Sync Users</name>
+        <command>Sync Users</command>
+      </action>
+      <action>
+        <name>Get Battery Status</name>
+        <command>Get Battery Status</command>
+      </action>
+      <!-- #ifndef DRIVERCENTRAL -->
+      <action>
+        <name>Update Drivers</name>
+        <command>Update_Drivers</command>
+      </action>
+      <!-- #endif -->
+    </actions>
+    <commands>
+      <command>
+        <name>Sync Users</name>
+        <description>Re-send NAME's user codes and schedules to the lock</description>
+      </command>
+      <command>
+        <name>Get Battery Status</name>
+        <description>Refresh NAME's battery level</description>
+      </command>
+    </commands>
+    <properties>
+      <property>
+        <name>Cloud</name>
+        <type>LABEL</type>
+        <default>Cloud Settings</default>
+      </property>
+      <!-- #ifdef DRIVERCENTRAL -->
+      <property>
+        <name>Cloud Status</name>
+        <type>STRING</type>
+        <readonly>true</readonly>
+        <default/>
+      </property>
+      <!-- #endif -->
+      <property>
+        <name>Automatic Updates</name>
+        <type>LIST</type>
+        <default>On</default>
+        <items>
+          <item>Off</item>
+          <item>On</item>
+        </items>
+      </property>
+      <!-- #ifndef DRIVERCENTRAL -->
+      <property>
+        <name>Update Channel</name>
+        <type>LIST</type>
+        <default>Production</default>
+        <items>
+          <item>Production</item>
+          <item>Prerelease</item>
+        </items>
+      </property>
+      <!-- #endif -->
+      <property>
+        <name>Driver Settings</name>
+        <type>LABEL</type>
+        <default>Driver Settings</default>
+      </property>
+      <property>
+        <name>Driver Status</name>
+        <type>STRING</type>
+        <readonly>true</readonly>
+        <default/>
+      </property>
+      <property>
+        <name>Driver Version</name>
+        <type>STRING</type>
+        <readonly>true</readonly>
+        <default/>
+      </property>
+      <property>
+        <name>Firmware Version</name>
+        <type>STRING</type>
+        <readonly>true</readonly>
+        <default>--</default>
+      </property>
+      <property>
+        <name>Log Level</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>3 - Info</default>
+        <items>
+          <item>0 - Fatal</item>
+          <item>1 - Error</item>
+          <item>2 - Warning</item>
+          <item>3 - Info</item>
+          <item>4 - Debug</item>
+          <item>5 - Trace</item>
+          <item>6 - Ultra</item>
+        </items>
+      </property>
+      <property>
+        <name>Log Mode</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Off</default>
+        <items>
+          <item>Off</item>
+          <item>Print</item>
+          <item>Log</item>
+          <item>Print and Log</item>
+        </items>
+      </property>
+    </properties>
+  </config>
+
+  <connections>
+    <connection>
+      <id>5001</id>
+      <facing>6</facing>
+      <connectionname>Lock</connectionname>
+      <type>2</type>
+      <consumer>False</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>False</linelevel>
+      <classes>
+        <class>
+          <classname>LOCK</classname>
+        </class>
+      </classes>
+      <hidden>True</hidden>
+    </connection>
+    <connection>
+      <id>6001</id>
+      <facing>6</facing>
+      <connectionname>ZIGBEE</connectionname>
+      <type>4</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>ZIGBEE</classname>
+        </class>
+      </classes>
+    </connection>
+  </connections>
+</devicedata>
