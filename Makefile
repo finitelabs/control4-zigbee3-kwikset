@@ -2,7 +2,7 @@
 # Run `make help` for available targets.
 
 DISTRIBUTIONS := drivercentral oss
-README_DRIVER := kwikset_lock
+README_DRIVER := kwikset_zigbee3_lock
 README_BUILD  := oss
 
 # Paths

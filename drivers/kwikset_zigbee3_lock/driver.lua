@@ -12,10 +12,10 @@
 --#ifdef DRIVERCENTRAL
 DC_PID = 0 -- TODO: Assign DriverCentral product ID
 DC_X = nil
-DC_FILENAME = "kwikset_lock.c4z"
+DC_FILENAME = "kwikset_zigbee3_lock.c4z"
 --#else
 DRIVER_GITHUB_REPO = "finitelabs/control4-zigbee3-kwikset"
-DRIVER_FILENAMES = { "kwikset_lock.c4z" }
+DRIVER_FILENAMES = { "kwikset_zigbee3_lock.c4z" }
 --#endif
 
 require("lib.utils")

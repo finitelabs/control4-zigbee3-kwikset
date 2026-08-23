@@ -7,5 +7,5 @@ primary_color: '#D12231'
 project_description: Zigbee 3.0 Kwikset SmartCode lock driver for Control4
 project_name: control4-zigbee3-kwikset
 readme_build: oss
-readme_driver_slug: kwikset_lock
+readme_driver_slug: kwikset_zigbee3_lock
 vendor_modules: ''
