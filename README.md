@@ -281,7 +281,7 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Removed
 -->
 
-## Unreleased
+## v1.0.0 - 2026-08-23
 
 - Added a Zigbee 3.0 Kwikset SmartCode lock driver that speaks ZCL DoorLock
   directly to the lock - no hub, bridge, or cloud required
