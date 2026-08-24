@@ -445,10 +445,9 @@ local function notifySettings()
 end
 
 --- Push the capability set that matches state.supportsUserCodes to the proxy.
---- Called on init from the persisted verdict (so a reload does not briefly
---- re-expose user management before the sleepy lock answers a probe) and whenever
---- the verdict changes. Lock/unlock, status, battery, auto-lock, and history are
---- never touched.
+--- Called on init to assert the persisted verdict (correcting any stale value the
+--- proxy kept across a driver update) and whenever the verdict changes.
+--- Lock/unlock, status, battery, auto-lock, and history are never touched.
 local function applyUserCodeCapabilities()
   local value = state.supportsUserCodes and "true" or "false"
   for _, name in ipairs(USER_CODE_CAPABILITIES) do
@@ -2274,15 +2273,15 @@ function OnDriverLateInit()
   -- Tell the proxy our reachability up front, then let it initialize.
   notify("ONLINE_CHANGED", { STATE = state.online and true or false })
   notifyLockInitialize()
-  -- Re-apply a known "no keypad" verdict from persistence right away, so a reload
-  -- does not re-expose user management until the sleepy lock answers a probe.
-  if not state.supportsUserCodes then
-    applyUserCodeCapabilities()
-  end
-  -- Same for learned per-setting support verdicts.
-  if next(state.settingSupport) ~= nil then
-    applySettingCapabilities()
-  end
+  -- Assert both capability verdicts from persistence on every init, mirroring the
+  -- REQUEST_CAPABILITIES handler. The proxy persists capability values and a
+  -- driver update resets them toward the restrictive driver.xml defaults, so a
+  -- keypad lock (supportsUserCodes true, only ever set by a definitive keypad
+  -- verdict) must re-assert here or user management stays hidden until something
+  -- happens to re-request. A keypadless or not-yet-probed lock asserts the
+  -- restricted set, which is correct.
+  applyUserCodeCapabilities()
+  applySettingCapabilities()
   -- Writes owed from before the reload: re-arm the retry window but don't blast
   -- the sleeping lock now - its next inbound packet flushes them.
   armPendingTimer()
