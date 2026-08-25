@@ -171,10 +171,14 @@ local CL_POWER = 0x0001
 local CLUSTERS = { { cluster = CL_DOORLOCK, srcEp = 1 }, { cluster = CL_POWER, srcEp = 1 } }
 
 -- One binding-table record (repeated field 5): { 2=srcEp, 3=cluster, 5=dstEui,
--- 6=dstEp }. dstEp defaults to the gateway endpoint the flow probes to, so a
--- record confirms the exact triple bindFrame requested.
+-- 6=dstEp }. dstEp defaults to the probed gateway endpoint; pass false to omit
+-- field 6 entirely, modelling a firmware that does not enumerate it.
 local function bindRecord(srcEp, cluster, dstHex, dstEp)
-  return pbLD(5, pbVI(2, srcEp) .. pbVI(3, cluster) .. pbF64(5, dstHex) .. pbVI(6, dstEp or GW_EP))
+  local rec = pbVI(2, srcEp) .. pbVI(3, cluster) .. pbF64(5, dstHex)
+  if dstEp ~= false then
+    rec = rec .. pbVI(6, dstEp or GW_EP)
+  end
+  return pbLD(5, rec)
 end
 -- Wrap a binding table as the incoming-zdo PUBLISH the verify step reads. The
 -- ZDO response buffer the flow parses sits at command-frame field 8, nested as
@@ -191,6 +195,9 @@ local TABLE_WRONG_EP = incomingZdo(bindRecord(99, CL_DOORLOCK, COORD) .. bindRec
 -- (destination) endpoint than the flow probed: also must not count as our bind.
 local TABLE_WRONG_DSTEP =
   incomingZdo(bindRecord(1, CL_DOORLOCK, COORD, GW_EP + 1) .. bindRecord(1, CL_POWER, COORD, GW_EP + 1))
+-- Both target clusters bound to the coordinator with no destination-endpoint
+-- field at all (a firmware that does not enumerate it): must still confirm.
+local TABLE_NO_DSTEP = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD, false) .. bindRecord(1, CL_POWER, COORD, false))
 
 -- Scripted socket. receive() replays {data, err, partial} triples in order; once
 -- the script is exhausted it reports a would-block so drain()'s loop breaks.
@@ -459,6 +466,27 @@ do
   zb:drain() -- the exact triple is now present
 
   check("settles once the exact triple is present", rec.ok == true, tostring(rec.ok))
+  check("state returns to idle", zb.state == "idle", zb.state)
+end
+
+--------------------------------------------------------------------------------
+print("\n[9] records that omit the endpoint field still confirm the target")
+--------------------------------------------------------------------------------
+do
+  local zb, rec = runToVerify({
+    { CONNACK, nil, nil },
+    { nil, "timeout", "" },
+    { EXEC_OK_PUBLISH, nil, nil },
+    { nil, "timeout", "" },
+    { TABLE_NO_DSTEP, nil, nil }, -- records carry no field 6; tolerated
+    { nil, "timeout", "" },
+  })
+  local before = publishCount(currentFake)
+  zb:drain() -- (srcEp, cluster, coordinator) present, endpoint field absent -> confirmed
+
+  check("settles on (srcEp, cluster, coordinator) alone", rec.ok == true, tostring(rec.ok))
+  check("does not re-fire the already-present binds", publishCount(currentFake) == before, publishCount(currentFake))
+  check("callback fired exactly once", rec.count == 1, rec.count)
   check("state returns to idle", zb.state == "idle", zb.state)
 end
 
