@@ -170,9 +170,11 @@ local CL_DOORLOCK = 0x0101
 local CL_POWER = 0x0001
 local CLUSTERS = { { cluster = CL_DOORLOCK, srcEp = 1 }, { cluster = CL_POWER, srcEp = 1 } }
 
--- One binding-table record (repeated field 5): { 2=srcEp, 3=cluster, 5=dstEui }.
-local function bindRecord(srcEp, cluster, dstHex)
-  return pbLD(5, pbVI(2, srcEp) .. pbVI(3, cluster) .. pbF64(5, dstHex))
+-- One binding-table record (repeated field 5): { 2=srcEp, 3=cluster, 5=dstEui,
+-- 6=dstEp }. dstEp defaults to the gateway endpoint the flow probes to, so a
+-- record confirms the exact triple bindFrame requested.
+local function bindRecord(srcEp, cluster, dstHex, dstEp)
+  return pbLD(5, pbVI(2, srcEp) .. pbVI(3, cluster) .. pbF64(5, dstHex) .. pbVI(6, dstEp or GW_EP))
 end
 -- Wrap a binding table as the incoming-zdo PUBLISH the verify step reads. The
 -- ZDO response buffer the flow parses sits at command-frame field 8, nested as
@@ -182,6 +184,9 @@ local function incomingZdo(tableBuf)
 end
 local TABLE_BOTH = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD) .. bindRecord(1, CL_POWER, COORD))
 local TABLE_DOORLOCK_ONLY = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD))
+-- Both target clusters are bound to the coordinator, but on a different source
+-- endpoint (99) than the targets ask for (1): must not count as our bind.
+local TABLE_WRONG_EP = incomingZdo(bindRecord(99, CL_DOORLOCK, COORD) .. bindRecord(99, CL_POWER, COORD))
 
 -- Scripted socket. receive() replays {data, err, partial} triples in order; once
 -- the script is exhausted it reports a would-block so drain()'s loop breaks.
@@ -397,6 +402,33 @@ do
   check("timed-out flow settles as a failure", rec.ok == false, tostring(rec.ok))
   check("state returns to idle", zb.state == "idle", zb.state)
   check("coordinator cache dropped", store.zbindCoordEui == nil, tostring(store.zbindCoordEui))
+end
+
+--------------------------------------------------------------------------------
+print("\n[7] a same-cluster bind on a different endpoint is not our target")
+--------------------------------------------------------------------------------
+do
+  local zb, rec = runToVerify({
+    { CONNACK, nil, nil },
+    { nil, "timeout", "" },
+    { EXEC_OK_PUBLISH, nil, nil },
+    { nil, "timeout", "" },
+    { TABLE_WRONG_EP, nil, nil }, -- clusters bound, but on srcEp 99 not the target's 1
+    { nil, "timeout", "" },
+    { TABLE_BOTH, nil, nil }, -- the correct-endpoint table on the re-read
+    { nil, "timeout", "" },
+  })
+  local before = publishCount(currentFake)
+  zb:drain() -- wrong-endpoint records must not satisfy the (srcEp, cluster) targets
+
+  check("does not settle on a wrong-endpoint match", rec.count == 0, rec.count)
+  check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
+
+  ShimFireTimers()
+  zb:drain() -- the exact triple is now present
+
+  check("settles once the exact triple is present", rec.ok == true, tostring(rec.ok))
+  check("state returns to idle", zb.state == "idle", zb.state)
 end
 
 print(string.format("\n%d passed, %d failed\n", pass, fail))

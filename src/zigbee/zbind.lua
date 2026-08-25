@@ -507,17 +507,26 @@ local function coordinatorFromBindingTable(rsp, ownEui)
   return found
 end
 
---- Set of clusters in a binding table that are bound to the coordinator, as
---- { [cluster] = true }. Used to confirm each target bind actually landed.
-local function boundClustersToCoord(rsp, coordEui)
+--- Key a binding by the exact triple bindFrame requests. Keying on cluster alone
+--- would let a same-cluster bind on a different source endpoint (or one left at a
+--- stale gateway endpoint) read as the bind we asked for, silently confirming a
+--- target that never landed.
+local function bindKey(srcEp, cluster)
+  return srcEp * 65536 + cluster
+end
+
+--- Set of our target binds present in a binding table, keyed by (srcEp, cluster):
+--- records whose destination is the coordinator at the current gateway endpoint.
+--- Used to confirm the exact bind we requested actually landed.
+local function boundTargets(rsp, coordEui, gwEp)
   local out = {}
   if not coordEui then
     return out
   end
   eachBindingRecord(rsp, function(rec)
-    local cluster = tonumber(rec[3])
-    if cluster and hexLE(rec[5]) == coordEui then
-      out[cluster] = true
+    local cluster, srcEp, dstEp = tonumber(rec[3]), tonumber(rec[2]), tonumber(rec[6])
+    if cluster and srcEp and dstEp == gwEp and hexLE(rec[5]) == coordEui then
+      out[bindKey(srcEp, cluster)] = true
     end
   end)
   return out
@@ -671,10 +680,10 @@ function ZBind:verifyRead()
     if not cf or type(cf[8]) ~= "string" then
       return
     end
-    local bound = boundClustersToCoord(cf[8], self.coordEui)
+    local bound = boundTargets(cf[8], self.coordEui, self.gwEp)
     local missing = {}
     for _, c in ipairs(self.clusters) do
-      if not bound[c.cluster] then
+      if not bound[bindKey(c.srcEp, c.cluster)] then
         missing[#missing + 1] = c
       end
     end
