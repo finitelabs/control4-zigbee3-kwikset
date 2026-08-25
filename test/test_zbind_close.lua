@@ -198,6 +198,11 @@ local TABLE_WRONG_DSTEP =
 -- Both target clusters bound to the coordinator with no destination-endpoint
 -- field at all (a firmware that does not enumerate it): must still confirm.
 local TABLE_NO_DSTEP = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD, false) .. bindRecord(1, CL_POWER, COORD, false))
+-- A destination EUI that is not the coordinator, derived from COORD so it cannot
+-- collide with it. Both clusters bound on the right source endpoint but to this
+-- other node: must not count as our bind.
+local OTHER_EUI = (COORD:gsub("%x%x$", "99"))
+local TABLE_WRONG_DST = incomingZdo(bindRecord(1, CL_DOORLOCK, OTHER_EUI) .. bindRecord(1, CL_POWER, OTHER_EUI))
 
 -- Scripted socket. receive() replays {data, err, partial} triples in order; once
 -- the script is exhausted it reports a would-block so drain()'s loop breaks.
@@ -487,6 +492,33 @@ do
   check("settles on (srcEp, cluster, coordinator) alone", rec.ok == true, tostring(rec.ok))
   check("does not re-fire the already-present binds", publishCount(currentFake) == before, publishCount(currentFake))
   check("callback fired exactly once", rec.count == 1, rec.count)
+  check("state returns to idle", zb.state == "idle", zb.state)
+end
+
+--------------------------------------------------------------------------------
+print("\n[10] a bind to a different destination node is not our target")
+--------------------------------------------------------------------------------
+do
+  local zb, rec = runToVerify({
+    { CONNACK, nil, nil },
+    { nil, "timeout", "" },
+    { EXEC_OK_PUBLISH, nil, nil },
+    { nil, "timeout", "" },
+    { TABLE_WRONG_DST, nil, nil }, -- right (srcEp, cluster), wrong destination node
+    { nil, "timeout", "" },
+    { TABLE_BOTH, nil, nil }, -- the coordinator destination on the re-read
+    { nil, "timeout", "" },
+  })
+  local before = publishCount(currentFake)
+  zb:drain() -- a record naming another destination must not confirm our bind
+
+  check("does not settle on a non-coordinator destination", rec.count == 0, rec.count)
+  check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
+
+  ShimFireTimers()
+  zb:drain() -- the coordinator destination is now present
+
+  check("settles once the coordinator bind is present", rec.ok == true, tostring(rec.ok))
   check("state returns to idle", zb.state == "idle", zb.state)
 end
 
