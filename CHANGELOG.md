@@ -18,6 +18,12 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Removed
 -->
 
+## Unreleased
+
+- Made real-time lock events more reliable: after binding the lock for live
+  updates, the driver confirms the binding landed in the lock's own table and
+  re-establishes it if missing, instead of silently falling back to the poll
+
 ## v20260823 - 2026-08-23
 
 - Added a Zigbee 3.0 Kwikset SmartCode lock driver that speaks ZCL DoorLock

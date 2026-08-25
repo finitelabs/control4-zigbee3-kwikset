@@ -1,4 +1,5 @@
--- Regression test for src/zigbee/zbind.lua broker-close handling in drain().
+-- Regression test for src/zigbee/zbind.lua: the bind bootstrap's read-back
+-- verify and its broker-close handling in drain().
 --
 -- Run from the driver root:
 --   make test
@@ -6,24 +7,27 @@
 --   LUA_PATH="$PWD/test/?.lua;$PWD/src/?.lua;$PWD/src/?/init.lua;$PWD/vendor/?.lua;$PWD/vendor/?/init.lua;;" \
 --     luajit -e "require('c4_shim')" test/test_zbind_close.lua
 --
--- A single socket read can return bytes AND signal a close at once. The bind flow
--- must settle correctly in every variant of that, because the close path also
--- decides whether the cached coordinator is kept or dropped, and a wrong settle
--- either strands the flow (callback never fires, every later run short-circuits on
--- the idle guard) or forces a needless full re-discovery. Both bugs this covers
--- were originally found by throwaway probes with no committed test behind them.
+-- After sending the binds the flow reads the device binding table back
+-- (Mgmt_Bind_rsp) and re-issues any target cluster that is not present, then
+-- settles. Two properties have to hold across every variant of that:
+--   1. Verify converges: all targets present -> finish(true) with the coordinator
+--      cache kept; a missing cluster is re-fired and re-checked after a settle;
+--      and the retry is bounded so a cluster that never lands still settles.
+--   2. The final read can carry a broker close in the same recv(), so a
+--      completing frame must be parsed before the flow settles, and an
+--      incomplete one must settle (not strand the callback): a wrong settle
+--      either leaves every later ensureBinds short-circuiting on the idle guard
+--      or forces a needless full re-discovery.
 --
 -- Cases:
---   A. completing frame arrives in the SAME read as the close -> parse it, reach
---      finish(true), cached coordinator/endpoint survive.
---   B. close carries a truncated (incomplete) frame -> settle finish(false),
---      cached coordinator/endpoint dropped.
---   C. close carries no bytes -> the err=="closed" branch is unreachable (the
---      empty-chunk break fires first), so drain does not settle; the step timeout
---      is what rescues it.
---   D. same race as A but the peer's close makes later writes fail -> the flow
---      still settles finish(true) and persists the cache, characterizing the
---      accepted best-effort trade (the remaining CLUSTER_POWER bind is dropped).
+--   1. table shows every target bound      -> finish(true), cache kept
+--   2. table missing one cluster, present  -> re-fire, finish(true)
+--      on the re-read after the settle
+--   3. a cluster never appears             -> bounded retries, still finish(true)
+--   4. completing table with the close     -> parse then finish(true), cache kept
+--   5. close carries a truncated table     -> finish(false), cache dropped
+--   6. close carries no bytes              -> drain does not settle; the step
+--      timeout rescues as finish(false)
 
 require("c4_shim")
 
@@ -125,6 +129,23 @@ end
 local function pbLD(field, data)
   return pbVarint(field * 8 + 2) .. pbVarint(#data) .. data
 end
+-- An EUI64 as a fixed64 in 8 little-endian bytes, matching the module's encoder
+-- so its hexLE() decodes the field back to the same address.
+local function pbF64(field, hex)
+  hex = tostring(hex or ""):gsub("[^%x]", "")
+  while #hex < 16 do
+    hex = "0" .. hex
+  end
+  local b = {}
+  for i = 1, 16, 2 do
+    b[#b + 1] = tonumber(hex:sub(i, i + 1), 16) or 0
+  end
+  local o = {}
+  for i = 8, 1, -1 do
+    o[#o + 1] = string.char(b[i])
+  end
+  return pbVarint(field * 8 + 1) .. table.concat(o)
+end
 
 local CONNACK = string.char(0x20, 0x02, 0x00, 0x00)
 
@@ -133,35 +154,47 @@ local function publish(topic, payload)
   return string.char(0x30) .. mqLen(#body) .. body
 end
 
+-- Handlers match only the topic suffix, so literal MAC/EUI segments are fine.
+local BASE = "s1/c4/protected/zigbee3-public-api/v1/MAC/device/EUI"
 -- exec-status/send-zdo carrying EXEC_OK (0): any{ 2: msg{ 2: 0 } }.
-local EXEC_TOPIC = "s1/c4/protected/zigbee3-public-api/v1/MAC/device/EUI/exec-status/send-zdo"
-local EXEC_OK_PUBLISH = publish(EXEC_TOPIC, pbLD(2, pbVI(2, 0)))
+local EXEC_OK_PUBLISH = publish(BASE .. "/exec-status/send-zdo", pbLD(2, pbVI(2, 0)))
 
 -- A PUBLISH header claiming 127 more bytes than are present: parse() cannot
 -- complete a packet, so it consumes nothing and the flow stays mid-step.
 local TRUNCATED = string.char(0x30, 0x7F) .. string.char(0, 0, 0)
 
+local EUI = "00124B0001AABBCC"
+local COORD = "00124B0001CE4B21"
+local GW_EP = 2
+local CL_DOORLOCK = 0x0101
+local CL_POWER = 0x0001
+local CLUSTERS = { { cluster = CL_DOORLOCK, srcEp = 1 }, { cluster = CL_POWER, srcEp = 1 } }
+
+-- One binding-table record (repeated field 5): { 2=srcEp, 3=cluster, 5=dstEui }.
+local function bindRecord(srcEp, cluster, dstHex)
+  return pbLD(5, pbVI(2, srcEp) .. pbVI(3, cluster) .. pbF64(5, dstHex))
+end
+-- Wrap a binding table as the incoming-zdo PUBLISH the verify step reads. The
+-- ZDO response buffer the flow parses sits at command-frame field 8, nested as
+-- any{2} -> msg{8} -> frame{3} -> cf{8}.
+local function incomingZdo(tableBuf)
+  return publish(BASE .. "/event/incoming-zdo", pbLD(2, pbLD(8, pbLD(3, pbLD(8, tableBuf)))))
+end
+local TABLE_BOTH = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD) .. bindRecord(1, CL_POWER, COORD))
+local TABLE_DOORLOCK_ONLY = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD))
+
 -- Scripted socket. receive() replays {data, err, partial} triples in order; once
 -- the script is exhausted it reports a would-block so drain()'s loop breaks.
-local function fakeSocket(script, failSendAfterClose)
+local function fakeSocket(script)
   return {
     _i = 0,
     _script = script,
-    _peerClosed = false,
-    dropped = 0,
     sent = {},
     connect = function()
       return 1
     end,
     settimeout = function() end,
     send = function(self, pkt)
-      -- A real unix socket rejects a write once the peer has closed, and rawSend
-      -- pcalls the send and discards the result, so the flow never sees it. The
-      -- default fake accepts every write; the failing variant models the reject.
-      if failSendAfterClose and self._peerClosed then
-        self.dropped = self.dropped + 1
-        return nil, "closed"
-      end
       self.sent[#self.sent + 1] = pkt
       return #pkt
     end,
@@ -174,24 +207,28 @@ local function fakeSocket(script, failSendAfterClose)
       if not step then
         return nil, "timeout", ""
       end
-      if step[2] == "closed" then
-        self._peerClosed = true
-      end
       return step[1], step[2], step[3]
     end,
   }
 end
 
-local EUI = "00124B0001AABBCC"
-local COORD = "00124B0001CE4B21"
-local GW_EP = 2
-local CLUSTERS = { { cluster = 0x0101, srcEp = 1 }, { cluster = 0x0001, srcEp = 1 } }
+local function publishCount(sock)
+  local n = 0
+  for _, pkt in ipairs(sock.sent) do
+    if #pkt > 0 and string.byte(pkt, 1) == 0x30 then
+      n = n + 1
+    end
+  end
+  return n
+end
 
--- Drive a fresh flow up to the point where the probe step is armed and awaiting
--- the exec-status response, i.e. one drain() that reads the CONNACK. Returns the
--- ZBind and a cb recorder; the fake socket is reachable as `currentFake`.
-local function runToProbe(script, failSendAfterClose)
-  currentFake = fakeSocket(script, failSendAfterClose)
+-- Drive a fresh flow to the point where the binds are sent and the verify read
+-- is armed, awaiting the binding table. The cached coordinator/endpoint let it
+-- skip discovery and go straight to the probe. The recurring drain timer is
+-- cancelled so ShimFireTimers only advances the settle/step timers and the test
+-- feeds socket data through explicit drain() calls.
+local function runToVerify(script)
+  currentFake = fakeSocket(script)
   setStore({ zbindCoordEui = COORD, zbindGwEp = GW_EP })
   local rec = { count = 0, ok = nil }
   local zb = ZBind:new()
@@ -199,27 +236,113 @@ local function runToProbe(script, failSendAfterClose)
     rec.count = rec.count + 1
     rec.ok = ok
   end)
-  zb:drain() -- reads CONNACK -> onConnack -> beginProbe (cached endpoint)
+  zb:drain() -- CONNACK -> onConnack -> beginProbe (probe bind sent)
+  zb:drain() -- EXEC_OK -> beginBindRest -> verifyRead (Mgmt_Bind read sent)
+  CancelTimer("ZBindDrain")
   return zb, rec
 end
 
 --------------------------------------------------------------------------------
-print("\n[A] completing frame arrives in the SAME read as the close")
+print("\n[1] binding table shows every target bound -> finish(true)")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToProbe({
+  local zb, rec = runToVerify({
     { CONNACK, nil, nil },
     { nil, "timeout", "" },
-    { nil, "closed", EXEC_OK_PUBLISH }, -- the accepting exec-status, plus close
+    { EXEC_OK_PUBLISH, nil, nil },
+    { nil, "timeout", "" },
+    { TABLE_BOTH, nil, nil },
     { nil, "timeout", "" },
   })
-  check("probe step is armed after the CONNACK", zb.state == "probe", zb.state)
-  check("flow has not settled before the close read", rec.count == 0, rec.count)
+  check("flow awaits the binding table after the probe accept", zb.state == "verify", zb.state)
+  check("flow has not settled before the table read", rec.count == 0, rec.count)
 
-  -- Clear the cache first, so a passing assertion proves finish(true) re-wrote it
-  -- rather than the seed merely lingering.
+  -- Clear the cache first, so a passing assertion proves finish(true) re-wrote it.
   store.zbindCoordEui, store.zbindGwEp = nil, nil
-  zb:drain()
+  zb:drain() -- reads TABLE_BOTH -> verify handler -> finish(true)
+
+  check("callback fired exactly once", rec.count == 1, rec.count)
+  check("flow settled successfully", rec.ok == true, tostring(rec.ok))
+  check("state returns to idle", zb.state == "idle", zb.state)
+  check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
+  check("gateway endpoint cache saved", store.zbindGwEp == GW_EP, tostring(store.zbindGwEp))
+end
+
+--------------------------------------------------------------------------------
+print("\n[2] table missing a cluster -> re-fire, confirm on re-read")
+--------------------------------------------------------------------------------
+do
+  local zb, rec = runToVerify({
+    { CONNACK, nil, nil },
+    { nil, "timeout", "" },
+    { EXEC_OK_PUBLISH, nil, nil },
+    { nil, "timeout", "" },
+    { TABLE_DOORLOCK_ONLY, nil, nil }, -- verify read 1: power bind absent
+    { nil, "timeout", "" },
+    { TABLE_BOTH, nil, nil }, -- verify read 2 (after settle): both present
+    { nil, "timeout", "" },
+  })
+  local before = publishCount(currentFake)
+  zb:drain() -- TABLE_DOORLOCK_ONLY -> re-fire power + arm the settle timer
+
+  check("did not settle on the incomplete table", rec.count == 0, rec.count)
+  check("re-fired the missing bind", publishCount(currentFake) > before, publishCount(currentFake))
+
+  ShimFireTimers() -- settle -> verifyRead again (sends a fresh Mgmt_Bind read)
+  zb:drain() -- TABLE_BOTH -> finish(true)
+
+  check("callback fired exactly once", rec.count == 1, rec.count)
+  check("flow settled successfully once verified", rec.ok == true, tostring(rec.ok))
+  check("state returns to idle", zb.state == "idle", zb.state)
+  check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
+end
+
+--------------------------------------------------------------------------------
+print("\n[3] a cluster never appears -> bounded retries, still finish(true)")
+--------------------------------------------------------------------------------
+do
+  local zb, rec = runToVerify({
+    { CONNACK, nil, nil },
+    { nil, "timeout", "" },
+    { EXEC_OK_PUBLISH, nil, nil },
+    { nil, "timeout", "" },
+    { TABLE_DOORLOCK_ONLY, nil, nil }, -- read 1
+    { nil, "timeout", "" },
+    { TABLE_DOORLOCK_ONLY, nil, nil }, -- read 2
+    { nil, "timeout", "" },
+    { TABLE_DOORLOCK_ONLY, nil, nil }, -- read 3 (retry cap)
+    { nil, "timeout", "" },
+    { TABLE_DOORLOCK_ONLY, nil, nil }, -- would be read 4 if it looped
+    { nil, "timeout", "" },
+  })
+  zb:drain() -- read 1 -> missing, re-fire, settle
+  check("does not settle on read 1", rec.count == 0, rec.count)
+  ShimFireTimers()
+  zb:drain() -- read 2 -> missing, re-fire, settle
+  check("does not settle on read 2", rec.count == 0, rec.count)
+  ShimFireTimers()
+  zb:drain() -- read 3 -> retry cap reached -> finish(true)
+
+  check("settles after the bounded retries", rec.count == 1, rec.count)
+  check("settles successfully (accepted binds kept)", rec.ok == true, tostring(rec.ok))
+  check("state returns to idle", zb.state == "idle", zb.state)
+  check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
+end
+
+--------------------------------------------------------------------------------
+print("\n[4] completing table arrives in the same read as the close")
+--------------------------------------------------------------------------------
+do
+  local zb, rec = runToVerify({
+    { CONNACK, nil, nil },
+    { nil, "timeout", "" },
+    { EXEC_OK_PUBLISH, nil, nil },
+    { nil, "timeout", "" },
+    { TABLE_BOTH, "closed", nil }, -- the confirming table, plus the close
+    { nil, "timeout", "" },
+  })
+  store.zbindCoordEui, store.zbindGwEp = nil, nil
+  zb:drain() -- close branch parses the table before settling -> finish(true)
 
   check("callback fired exactly once", rec.count == 1, rec.count)
   check("flow settled successfully", rec.ok == true, tostring(rec.ok))
@@ -230,17 +353,17 @@ do
 end
 
 --------------------------------------------------------------------------------
-print("\n[B] close carries a truncated frame (no completion possible)")
+print("\n[5] close carries a truncated table (no completion possible)")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToProbe({
+  local zb, rec = runToVerify({
     { CONNACK, nil, nil },
     { nil, "timeout", "" },
-    { nil, "closed", TRUNCATED },
+    { EXEC_OK_PUBLISH, nil, nil },
+    { nil, "timeout", "" },
+    { TRUNCATED, "closed", nil },
     { nil, "timeout", "" },
   })
-  check("probe step is armed after the CONNACK", zb.state == "probe", zb.state)
-
   zb:drain()
 
   check("callback fired exactly once", rec.count == 1, rec.count)
@@ -251,23 +374,22 @@ do
 end
 
 --------------------------------------------------------------------------------
-print("\n[C] close carries no bytes: fast settle is unreachable, timeout rescues")
+print("\n[6] close carries no bytes: drain does not settle, step timeout rescues")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToProbe({
+  local zb, rec = runToVerify({
     { CONNACK, nil, nil },
+    { nil, "timeout", "" },
+    { EXEC_OK_PUBLISH, nil, nil },
     { nil, "timeout", "" },
     { nil, "closed", "" }, -- empty-chunk break fires before the closed check
     { nil, "timeout", "" },
   })
-  check("probe step is armed after the CONNACK", zb.state == "probe", zb.state)
-
   zb:drain()
 
-  -- The contract the byte-less case pins: drain must NOT settle here.
   check("byte-less close does not settle in drain", rec.count == 0, rec.count)
-  check("flow is still mid-step after the empty close", zb.state == "probe", zb.state)
-  check("socket is left open for the step timer", currentFake.closed ~= true)
+  check("flow is still mid-verify after the empty close", zb.state == "verify", zb.state)
+  check("socket left open for the step timer", currentFake.closed ~= true)
 
   ShimFireTimers() -- the step timeout is the only thing that settles this case
 
@@ -275,38 +397,6 @@ do
   check("timed-out flow settles as a failure", rec.ok == false, tostring(rec.ok))
   check("state returns to idle", zb.state == "idle", zb.state)
   check("coordinator cache dropped", store.zbindCoordEui == nil, tostring(store.zbindCoordEui))
-end
-
---------------------------------------------------------------------------------
-print("\n[D] sends fail after the peer closes: accepted best-effort trade")
---------------------------------------------------------------------------------
-do
-  -- Same race as A (the accepting bind arrives with the close), but now every
-  -- write after that close is rejected the way a real socket rejects it. The
-  -- flow reaches beginBindRest and publishes the remaining CLUSTER_POWER bind
-  -- onto the dead socket; that write is dropped, yet finish(true) must still
-  -- stand and the cache must still persist. This is the single behavior a
-  -- send-always-succeeds fake cannot observe, so it is pinned explicitly.
-  local zb, rec = runToProbe({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { nil, "closed", EXEC_OK_PUBLISH },
-    { nil, "timeout", "" },
-  }, true)
-  store.zbindCoordEui, store.zbindGwEp = nil, nil
-  zb:drain()
-
-  check("settles success despite the post-close write failing", rec.ok == true, tostring(rec.ok))
-  check(
-    "cache persists on the accepted trade",
-    store.zbindCoordEui == COORD and store.zbindGwEp == GW_EP,
-    tostring(store.zbindCoordEui)
-  )
-  check(
-    "the remaining cluster bind was attempted after close and rejected",
-    currentFake.dropped == 1,
-    currentFake.dropped
-  )
 end
 
 print(string.format("\n%d passed, %d failed\n", pass, fail))

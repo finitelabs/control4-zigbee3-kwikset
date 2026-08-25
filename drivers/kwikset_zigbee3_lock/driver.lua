@@ -2084,9 +2084,12 @@ function establishEventBinds(force)
     return
   end
   gEventBindDone = true
+  -- Only DoorLock is bound: the lock pushes operation events for it. It answers
+  -- PowerConfig (battery) reads on request but refuses to bind that cluster for
+  -- reports (verified against the device binding table), so battery stays on the
+  -- hourly poll rather than a real-time report.
   binder:ensureBinds(euid, {
     { cluster = CLUSTER_DOORLOCK, srcEp = state.dstEndpoint },
-    { cluster = CLUSTER_POWER, srcEp = state.dstEndpoint },
   }, function(ok)
     if ok then
       log:info("Real-time event binding established (endpoint %d)", state.dstEndpoint)
