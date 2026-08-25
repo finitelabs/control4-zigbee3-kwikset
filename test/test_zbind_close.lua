@@ -187,6 +187,10 @@ local TABLE_DOORLOCK_ONLY = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD))
 -- Both target clusters are bound to the coordinator, but on a different source
 -- endpoint (99) than the targets ask for (1): must not count as our bind.
 local TABLE_WRONG_EP = incomingZdo(bindRecord(99, CL_DOORLOCK, COORD) .. bindRecord(99, CL_POWER, COORD))
+-- Both target clusters bound to the coordinator, but at a different gateway
+-- (destination) endpoint than the flow probed: also must not count as our bind.
+local TABLE_WRONG_DSTEP =
+  incomingZdo(bindRecord(1, CL_DOORLOCK, COORD, GW_EP + 1) .. bindRecord(1, CL_POWER, COORD, GW_EP + 1))
 
 -- Scripted socket. receive() replays {data, err, partial} triples in order; once
 -- the script is exhausted it reports a would-block so drain()'s loop breaks.
@@ -422,6 +426,33 @@ do
   zb:drain() -- wrong-endpoint records must not satisfy the (srcEp, cluster) targets
 
   check("does not settle on a wrong-endpoint match", rec.count == 0, rec.count)
+  check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
+
+  ShimFireTimers()
+  zb:drain() -- the exact triple is now present
+
+  check("settles once the exact triple is present", rec.ok == true, tostring(rec.ok))
+  check("state returns to idle", zb.state == "idle", zb.state)
+end
+
+--------------------------------------------------------------------------------
+print("\n[8] a bind at a different gateway endpoint is not our target")
+--------------------------------------------------------------------------------
+do
+  local zb, rec = runToVerify({
+    { CONNACK, nil, nil },
+    { nil, "timeout", "" },
+    { EXEC_OK_PUBLISH, nil, nil },
+    { nil, "timeout", "" },
+    { TABLE_WRONG_DSTEP, nil, nil }, -- bound to coord, but at gwEp+1 not the probed gwEp
+    { nil, "timeout", "" },
+    { TABLE_BOTH, nil, nil }, -- the correct gateway endpoint on the re-read
+    { nil, "timeout", "" },
+  })
+  local before = publishCount(currentFake)
+  zb:drain() -- a record naming a different gateway endpoint must not confirm our bind
+
+  check("does not settle on a wrong-gateway-endpoint match", rec.count == 0, rec.count)
   check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
 
   ShimFireTimers()

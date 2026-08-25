@@ -516,8 +516,11 @@ local function bindKey(srcEp, cluster)
 end
 
 --- Set of our target binds present in a binding table, keyed by (srcEp, cluster):
---- records whose destination is the coordinator at the current gateway endpoint.
---- Used to confirm the exact bind we requested actually landed.
+--- records whose destination is the coordinator. A record that positively names a
+--- different gateway endpoint is rejected (the stale-endpoint case); a record that
+--- omits the endpoint field is tolerated, so a firmware that does not enumerate it
+--- still confirms on (srcEp, cluster, coordinator) instead of reading as a
+--- permanent miss. Used to confirm the exact bind we requested actually landed.
 local function boundTargets(rsp, coordEui, gwEp)
   local out = {}
   if not coordEui then
@@ -525,7 +528,7 @@ local function boundTargets(rsp, coordEui, gwEp)
   end
   eachBindingRecord(rsp, function(rec)
     local cluster, srcEp, dstEp = tonumber(rec[3]), tonumber(rec[2]), tonumber(rec[6])
-    if cluster and srcEp and dstEp == gwEp and hexLE(rec[5]) == coordEui then
+    if cluster and srcEp and (dstEp == nil or dstEp == gwEp) and hexLE(rec[5]) == coordEui then
       out[bindKey(srcEp, cluster)] = true
     end
   end)
