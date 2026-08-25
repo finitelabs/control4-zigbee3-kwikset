@@ -5,7 +5,7 @@
 --   make test
 -- or:
 --   LUA_PATH="$PWD/test/?.lua;$PWD/src/?.lua;$PWD/src/?/init.lua;$PWD/vendor/?.lua;$PWD/vendor/?/init.lua;;" \
---     luajit -e "require('c4_shim')" test/test_zbind_close.lua
+--     luajit -e "require('c4_shim')" test/test_zbind.lua
 --
 -- After sending the binds the flow reads the device binding table back
 -- (Mgmt_Bind_rsp) and re-issues any target cluster that is not present, then
@@ -18,6 +18,9 @@
 --      incomplete one must settle (not strand the callback): a wrong settle
 --      either leaves every later ensureBinds short-circuiting on the idle guard
 --      or forces a needless full re-discovery.
+--   3. Verify confirms the exact bind requested - (srcEp, cluster) to the
+--      coordinator at the probed gateway endpoint - so a same-cluster bind on
+--      another endpoint, or one to another node, does not read as landed.
 --
 -- Cases:
 --   1. table shows every target bound      -> finish(true), cache kept
@@ -28,6 +31,10 @@
 --   5. close carries a truncated table     -> finish(false), cache dropped
 --   6. close carries no bytes              -> drain does not settle; the step
 --      timeout rescues as finish(false)
+--   7. same cluster on a different source endpoint  -> re-fire, not confirm
+--   8. bind at a different gateway endpoint          -> re-fire, not confirm
+--   9. record omits the endpoint field              -> still confirm
+--  10. bind to a different destination node          -> re-fire, not confirm
 
 require("c4_shim")
 
