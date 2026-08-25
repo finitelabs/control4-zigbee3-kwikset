@@ -281,7 +281,7 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Removed
 -->
 
-## Unreleased
+## v20260825 - 2026-08-25
 
 ### Changed
 
