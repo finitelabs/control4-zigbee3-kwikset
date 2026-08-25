@@ -12,8 +12,9 @@
 --- events arrive through the ordinary OnZigbeePacketIn path.
 ---
 --- The bind lives in the device and persists across driver reloads, so this only
---- needs to run at join/online. It is a best-effort enhancement: if any step
---- fails the driver keeps working on its state poll.
+--- needs to run at join/online. After sending the binds it reads the device's
+--- binding table back and re-issues any that did not land. It stays a best-effort
+--- enhancement: if any step fails the driver keeps working on its state poll.
 ---
 --- Fragility note: the transport, topic scheme, and protobuf field numbers here
 --- are undocumented zserver internals and may change with a controller OS
@@ -31,6 +32,11 @@ local DRAIN_MAX = 16
 local STEP_TIMEOUT_MS = 6 * ONE_SECOND
 local TIMER_DRAIN = "ZBindDrain"
 local TIMER_STEP = "ZBindStep"
+local TIMER_VERIFY = "ZBindVerify"
+-- After sending the binds, read the device binding table back and re-issue any
+-- target cluster that is not present, so a dropped or unapplied bind self-heals.
+local VERIFY_MAX_TRIES = 3
+local VERIFY_SETTLE_MS = 750
 -- zserver rejects a ZDO sequence above 127 (ZSTATUS_INVALID_PARAMETER).
 local ZDO_SEQ_MAX = 127
 -- ZDO clusters.
@@ -394,6 +400,7 @@ end
 function ZBind:close()
   CancelTimer(TIMER_STEP)
   CancelTimer(TIMER_DRAIN)
+  CancelTimer(TIMER_VERIFY)
   if self.sock then
     pcall(function()
       self.sock:close()
@@ -457,11 +464,11 @@ local function incomingCommandFrame(payload)
   return pbFields(frame[3])
 end
 
---- Walk a Mgmt_Bind_rsp buffer for the first binding record's destination
---- EUI64. Every binding on a commissioned device points at the coordinator, so
---- any record (typically the pre-existing Poll Control entry) yields its
---- address. Binding records are repeated field 5 (tag 0x2a).
-local function coordinatorFromBindingTable(rsp, ownEui)
+--- Walk the binding records in a Mgmt_Bind_rsp buffer, calling fn with each
+--- record's decoded fields. Records are the response's repeated field 5 (tag
+--- 0x2a); a record decodes to { [2]=srcEp, [3]=cluster, [5]=dstEui(8 LE bytes),
+--- [6]=dstEp }, the same layout the Bind_req record is built with.
+local function eachBindingRecord(rsp, fn)
   local i = 1
   while i <= #rsp do
     if string.byte(rsp, i) == 0x2a then
@@ -475,17 +482,57 @@ local function coordinatorFromBindingTable(rsp, ownEui)
           break
         end
       end
-      local rec = pbFields(rsp:sub(k, k + n - 1))
-      local dst = hexLE(rec[5])
-      if dst and dst ~= ownEui then
-        return dst
-      end
+      fn(pbFields(rsp:sub(k, k + n - 1)))
       i = k + n
     else
       i = i + 1
     end
   end
-  return nil
+end
+
+--- The coordinator EUID from a binding table. Every binding on a commissioned
+--- device points at the coordinator, so the first record whose destination is
+--- not the device itself yields its address (typically the pre-existing Poll
+--- Control entry).
+local function coordinatorFromBindingTable(rsp, ownEui)
+  local found
+  eachBindingRecord(rsp, function(rec)
+    if not found then
+      local dst = hexLE(rec[5])
+      if dst and dst ~= ownEui then
+        found = dst
+      end
+    end
+  end)
+  return found
+end
+
+--- Key a binding by the exact triple bindFrame requests. Keying on cluster alone
+--- would let a same-cluster bind on a different source endpoint (or one left at a
+--- stale gateway endpoint) read as the bind we asked for, silently confirming a
+--- target that never landed.
+local function bindKey(srcEp, cluster)
+  return srcEp * 65536 + cluster
+end
+
+--- Set of our target binds present in a binding table, keyed by (srcEp, cluster):
+--- records whose destination is the coordinator. A record that positively names a
+--- different gateway endpoint is rejected (the stale-endpoint case); a record that
+--- omits the endpoint field is tolerated, so a firmware that does not enumerate it
+--- still confirms on (srcEp, cluster, coordinator) instead of reading as a
+--- permanent miss. Used to confirm the exact bind we requested actually landed.
+local function boundTargets(rsp, coordEui, gwEp)
+  local out = {}
+  if not coordEui then
+    return out
+  end
+  eachBindingRecord(rsp, function(rec)
+    local cluster, srcEp, dstEp = tonumber(rec[3]), tonumber(rec[2]), tonumber(rec[6])
+    if cluster and srcEp and (dstEp == nil or dstEp == gwEp) and hexLE(rec[5]) == coordEui then
+      out[bindKey(srcEp, cluster)] = true
+    end
+  end)
+  return out
 end
 
 --- Build a ZDO Bind_req command frame binding one cluster to the coordinator.
@@ -518,7 +565,8 @@ function ZBind:finish(ok, note)
   self.state = "idle"
   if ok then
     log:info(
-      "zbind: bound %d cluster(s) to coordinator %s (gateway ep %s)",
+      "zbind: bound %d/%d cluster(s) to coordinator %s (gateway ep %s)",
+      self.boundCount or #self.clusters,
       #self.clusters,
       self.coordEui,
       tostring(self.gwEp)
@@ -609,14 +657,60 @@ function ZBind:beginProbe()
   tryNext()
 end
 
---- BIND: the first cluster is already bound from the probe; fire the rest and
---- finish. These are best-effort; we do not gate success on each response.
+--- BIND: the probe already bound the first cluster; fire the rest, then verify.
 function ZBind:beginBindRest()
   for idx = 2, #self.clusters do
     local c = self.clusters[idx]
     self:sendZdo(ZDO_BIND_REQ, self:bindFrame(c.srcEp, c.cluster, self.gwEp))
   end
-  self:finish(true)
+  self.verifyTries = 0
+  self:verifyRead()
+end
+
+--- VERIFY: read the device binding table back and re-issue any target cluster
+--- that is not present, so a dropped or unapplied bind self-heals. This confirms
+--- every cluster (including the probe's), upgrading each from "zserver accepted"
+--- to "present in the device's own table". Bounded retries; on exhaustion we
+--- still finish success, keeping whatever bound rather than dropping the cache
+--- and re-discovering from scratch (the persisted OTA binds still deliver).
+function ZBind:verifyRead()
+  self.verifyTries = self.verifyTries + 1
+  self:setStep("verify", function(_, topic, payload)
+    if not topic:find("event/incoming%-zdo") then
+      return
+    end
+    local cf = incomingCommandFrame(payload)
+    if not cf or type(cf[8]) ~= "string" then
+      return
+    end
+    local bound = boundTargets(cf[8], self.coordEui, self.gwEp)
+    local missing = {}
+    for _, c in ipairs(self.clusters) do
+      if not bound[bindKey(c.srcEp, c.cluster)] then
+        missing[#missing + 1] = c
+      end
+    end
+    if #missing == 0 then
+      self.boundCount = #self.clusters
+      return self:finish(true)
+    end
+    for _, c in ipairs(missing) do
+      self:sendZdo(ZDO_BIND_REQ, self:bindFrame(c.srcEp, c.cluster, self.gwEp))
+    end
+    if self.verifyTries >= VERIFY_MAX_TRIES then
+      log:debug("zbind: %d bind(s) unconfirmed after %d tries", #missing, self.verifyTries)
+      self.boundCount = #self.clusters - #missing
+      return self:finish(true)
+    end
+    -- Stop handling this read; let the re-fired binds settle, then re-read. Drop
+    -- the step timeout first so it can't fire finish() during the settle window.
+    self.awaiting = nil
+    CancelTimer(TIMER_STEP)
+    SetTimer(TIMER_VERIFY, VERIFY_SETTLE_MS, function()
+      self:verifyRead()
+    end)
+  end)
+  self:sendZdo(ZDO_MGMT_BIND_REQ, pbLD(7, pbVI(1, 0)))
 end
 
 --- Establish real-time bindings for a joined device.
