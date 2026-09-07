@@ -36,6 +36,8 @@
 --   9. record omits the endpoint field              -> still confirm
 --  10. bind to a different destination node          -> re-fire, not confirm
 
+local T = require("testlib")
+
 require("c4_shim")
 
 -- Not provided by the shim; the flow reads both during connect()/ensureBinds().
@@ -88,17 +90,6 @@ local logging = require("lib.logging")
 for _, m in ipairs({ "trace", "debug", "info", "warn", "error" }) do
   if type(logging[m]) == "function" then
     logging[m] = function() end
-  end
-end
-
-local pass, fail = 0, 0
-local function check(name, ok, detail)
-  if ok then
-    pass = pass + 1
-    print(string.format("  ok   %s", name))
-  else
-    fail = fail + 1
-    print(string.format("  FAIL %s%s", name, detail and ("  -> " .. tostring(detail)) or ""))
   end
 end
 
@@ -271,7 +262,7 @@ local function runToVerify(script)
 end
 
 --------------------------------------------------------------------------------
-print("\n[1] binding table shows every target bound -> finish(true)")
+T.section("binding table shows every target bound -> finish(true)")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -282,22 +273,22 @@ do
     { TABLE_BOTH, nil, nil },
     { nil, "timeout", "" },
   })
-  check("flow awaits the binding table after the probe accept", zb.state == "verify", zb.state)
-  check("flow has not settled before the table read", rec.count == 0, rec.count)
+  T.check("flow awaits the binding table after the probe accept", zb.state == "verify", zb.state)
+  T.check("flow has not settled before the table read", rec.count == 0, rec.count)
 
   -- Clear the cache first, so a passing assertion proves finish(true) re-wrote it.
   store.zbindCoordEui, store.zbindGwEp = nil, nil
   zb:drain() -- reads TABLE_BOTH -> verify handler -> finish(true)
 
-  check("callback fired exactly once", rec.count == 1, rec.count)
-  check("flow settled successfully", rec.ok == true, tostring(rec.ok))
-  check("state returns to idle", zb.state == "idle", zb.state)
-  check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
-  check("gateway endpoint cache saved", store.zbindGwEp == GW_EP, tostring(store.zbindGwEp))
+  T.check("callback fired exactly once", rec.count == 1, rec.count)
+  T.check("flow settled successfully", rec.ok == true, tostring(rec.ok))
+  T.check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
+  T.check("gateway endpoint cache saved", store.zbindGwEp == GW_EP, tostring(store.zbindGwEp))
 end
 
 --------------------------------------------------------------------------------
-print("\n[2] table missing a cluster -> re-fire, confirm on re-read")
+T.section("table missing a cluster -> re-fire, confirm on re-read")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -313,20 +304,20 @@ do
   local before = publishCount(currentFake)
   zb:drain() -- TABLE_DOORLOCK_ONLY -> re-fire power + arm the settle timer
 
-  check("did not settle on the incomplete table", rec.count == 0, rec.count)
-  check("re-fired the missing bind", publishCount(currentFake) > before, publishCount(currentFake))
+  T.check("did not settle on the incomplete table", rec.count == 0, rec.count)
+  T.check("re-fired the missing bind", publishCount(currentFake) > before, publishCount(currentFake))
 
   ShimFireTimers() -- settle -> verifyRead again (sends a fresh Mgmt_Bind read)
   zb:drain() -- TABLE_BOTH -> finish(true)
 
-  check("callback fired exactly once", rec.count == 1, rec.count)
-  check("flow settled successfully once verified", rec.ok == true, tostring(rec.ok))
-  check("state returns to idle", zb.state == "idle", zb.state)
-  check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
+  T.check("callback fired exactly once", rec.count == 1, rec.count)
+  T.check("flow settled successfully once verified", rec.ok == true, tostring(rec.ok))
+  T.check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
 end
 
 --------------------------------------------------------------------------------
-print("\n[3] a cluster never appears -> bounded retries, still finish(true)")
+T.section("a cluster never appears -> bounded retries, still finish(true)")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -344,21 +335,21 @@ do
     { nil, "timeout", "" },
   })
   zb:drain() -- read 1 -> missing, re-fire, settle
-  check("does not settle on read 1", rec.count == 0, rec.count)
+  T.check("does not settle on read 1", rec.count == 0, rec.count)
   ShimFireTimers()
   zb:drain() -- read 2 -> missing, re-fire, settle
-  check("does not settle on read 2", rec.count == 0, rec.count)
+  T.check("does not settle on read 2", rec.count == 0, rec.count)
   ShimFireTimers()
   zb:drain() -- read 3 -> retry cap reached -> finish(true)
 
-  check("settles after the bounded retries", rec.count == 1, rec.count)
-  check("settles successfully (accepted binds kept)", rec.ok == true, tostring(rec.ok))
-  check("state returns to idle", zb.state == "idle", zb.state)
-  check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
+  T.check("settles after the bounded retries", rec.count == 1, rec.count)
+  T.check("settles successfully (accepted binds kept)", rec.ok == true, tostring(rec.ok))
+  T.check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
 end
 
 --------------------------------------------------------------------------------
-print("\n[4] completing table arrives in the same read as the close")
+T.section("completing table arrives in the same read as the close")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -372,16 +363,16 @@ do
   store.zbindCoordEui, store.zbindGwEp = nil, nil
   zb:drain() -- close branch parses the table before settling -> finish(true)
 
-  check("callback fired exactly once", rec.count == 1, rec.count)
-  check("flow settled successfully", rec.ok == true, tostring(rec.ok))
-  check("state returns to idle", zb.state == "idle", zb.state)
-  check("coordinator cache survives", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
-  check("gateway endpoint cache survives", store.zbindGwEp == GW_EP, tostring(store.zbindGwEp))
-  check("socket was closed on settle", currentFake.closed == true)
+  T.check("callback fired exactly once", rec.count == 1, rec.count)
+  T.check("flow settled successfully", rec.ok == true, tostring(rec.ok))
+  T.check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("coordinator cache survives", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
+  T.check("gateway endpoint cache survives", store.zbindGwEp == GW_EP, tostring(store.zbindGwEp))
+  T.check("socket was closed on settle", currentFake.closed == true)
 end
 
 --------------------------------------------------------------------------------
-print("\n[5] close carries a truncated table (no completion possible)")
+T.section("close carries a truncated table (no completion possible)")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -394,15 +385,15 @@ do
   })
   zb:drain()
 
-  check("callback fired exactly once", rec.count == 1, rec.count)
-  check("flow settled as a failure", rec.ok == false, tostring(rec.ok))
-  check("state returns to idle", zb.state == "idle", zb.state)
-  check("coordinator cache dropped", store.zbindCoordEui == nil, tostring(store.zbindCoordEui))
-  check("gateway endpoint cache dropped", store.zbindGwEp == nil, tostring(store.zbindGwEp))
+  T.check("callback fired exactly once", rec.count == 1, rec.count)
+  T.check("flow settled as a failure", rec.ok == false, tostring(rec.ok))
+  T.check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("coordinator cache dropped", store.zbindCoordEui == nil, tostring(store.zbindCoordEui))
+  T.check("gateway endpoint cache dropped", store.zbindGwEp == nil, tostring(store.zbindGwEp))
 end
 
 --------------------------------------------------------------------------------
-print("\n[6] close carries no bytes: drain does not settle, step timeout rescues")
+T.section("close carries no bytes: drain does not settle, step timeout rescues")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -415,20 +406,20 @@ do
   })
   zb:drain()
 
-  check("byte-less close does not settle in drain", rec.count == 0, rec.count)
-  check("flow is still mid-verify after the empty close", zb.state == "verify", zb.state)
-  check("socket left open for the step timer", currentFake.closed ~= true)
+  T.check("byte-less close does not settle in drain", rec.count == 0, rec.count)
+  T.check("flow is still mid-verify after the empty close", zb.state == "verify", zb.state)
+  T.check("socket left open for the step timer", currentFake.closed ~= true)
 
   ShimFireTimers() -- the step timeout is the only thing that settles this case
 
-  check("step timeout settles the flow", rec.count == 1, rec.count)
-  check("timed-out flow settles as a failure", rec.ok == false, tostring(rec.ok))
-  check("state returns to idle", zb.state == "idle", zb.state)
-  check("coordinator cache dropped", store.zbindCoordEui == nil, tostring(store.zbindCoordEui))
+  T.check("step timeout settles the flow", rec.count == 1, rec.count)
+  T.check("timed-out flow settles as a failure", rec.ok == false, tostring(rec.ok))
+  T.check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("coordinator cache dropped", store.zbindCoordEui == nil, tostring(store.zbindCoordEui))
 end
 
 --------------------------------------------------------------------------------
-print("\n[7] a same-cluster bind on a different endpoint is not our target")
+T.section("a same-cluster bind on a different endpoint is not our target")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -444,18 +435,18 @@ do
   local before = publishCount(currentFake)
   zb:drain() -- wrong-endpoint records must not satisfy the (srcEp, cluster) targets
 
-  check("does not settle on a wrong-endpoint match", rec.count == 0, rec.count)
-  check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
+  T.check("does not settle on a wrong-endpoint match", rec.count == 0, rec.count)
+  T.check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
 
   ShimFireTimers()
   zb:drain() -- the exact triple is now present
 
-  check("settles once the exact triple is present", rec.ok == true, tostring(rec.ok))
-  check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("settles once the exact triple is present", rec.ok == true, tostring(rec.ok))
+  T.check("state returns to idle", zb.state == "idle", zb.state)
 end
 
 --------------------------------------------------------------------------------
-print("\n[8] a bind at a different gateway endpoint is not our target")
+T.section("a bind at a different gateway endpoint is not our target")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -471,18 +462,18 @@ do
   local before = publishCount(currentFake)
   zb:drain() -- a record naming a different gateway endpoint must not confirm our bind
 
-  check("does not settle on a wrong-gateway-endpoint match", rec.count == 0, rec.count)
-  check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
+  T.check("does not settle on a wrong-gateway-endpoint match", rec.count == 0, rec.count)
+  T.check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
 
   ShimFireTimers()
   zb:drain() -- the exact triple is now present
 
-  check("settles once the exact triple is present", rec.ok == true, tostring(rec.ok))
-  check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("settles once the exact triple is present", rec.ok == true, tostring(rec.ok))
+  T.check("state returns to idle", zb.state == "idle", zb.state)
 end
 
 --------------------------------------------------------------------------------
-print("\n[9] records that omit the endpoint field still confirm the target")
+T.section("records that omit the endpoint field still confirm the target")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -496,14 +487,14 @@ do
   local before = publishCount(currentFake)
   zb:drain() -- (srcEp, cluster, coordinator) present, endpoint field absent -> confirmed
 
-  check("settles on (srcEp, cluster, coordinator) alone", rec.ok == true, tostring(rec.ok))
-  check("does not re-fire the already-present binds", publishCount(currentFake) == before, publishCount(currentFake))
-  check("callback fired exactly once", rec.count == 1, rec.count)
-  check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("settles on (srcEp, cluster, coordinator) alone", rec.ok == true, tostring(rec.ok))
+  T.check("does not re-fire the already-present binds", publishCount(currentFake) == before, publishCount(currentFake))
+  T.check("callback fired exactly once", rec.count == 1, rec.count)
+  T.check("state returns to idle", zb.state == "idle", zb.state)
 end
 
 --------------------------------------------------------------------------------
-print("\n[10] a bind to a different destination node is not our target")
+T.section("a bind to a different destination node is not our target")
 --------------------------------------------------------------------------------
 do
   local zb, rec = runToVerify({
@@ -519,15 +510,14 @@ do
   local before = publishCount(currentFake)
   zb:drain() -- a record naming another destination must not confirm our bind
 
-  check("does not settle on a non-coordinator destination", rec.count == 0, rec.count)
-  check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
+  T.check("does not settle on a non-coordinator destination", rec.count == 0, rec.count)
+  T.check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
 
   ShimFireTimers()
   zb:drain() -- the coordinator destination is now present
 
-  check("settles once the coordinator bind is present", rec.ok == true, tostring(rec.ok))
-  check("state returns to idle", zb.state == "idle", zb.state)
+  T.check("settles once the coordinator bind is present", rec.ok == true, tostring(rec.ok))
+  T.check("state returns to idle", zb.state == "idle", zb.state)
 end
 
-print(string.format("\n%d passed, %d failed\n", pass, fail))
-os.exit(fail == 0 and 0 or 1)
+T.finish()
