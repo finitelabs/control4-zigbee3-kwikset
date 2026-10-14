@@ -1504,7 +1504,7 @@ local function upsertUser(tParams, isEdit)
   end
   local prev = state.users[id]
   local prevCode = prev and prev.code or nil
-  local prevActive = prev ~= nil and (prev.active and true or false) or nil
+  local prevActive = prev and toboolean(prev.active)
   local u = prev or {}
   u.name = Select(tParams, "USER_NAME") or u.name or ("User " .. id)
   if not IsEmpty(code) then
