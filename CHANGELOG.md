@@ -18,6 +18,14 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Removed
 -->
 
+## Unreleased
+
+### Fixed
+
+- Fixed one-touch locking that had been turned off showing as on after a driver
+  update or controller reboot, where a change the lock had not yet confirmed
+  could be sent to it as on; the setting now loads as it was saved
+
 ## v20260825 - 2026-08-25
 
 ### Changed
