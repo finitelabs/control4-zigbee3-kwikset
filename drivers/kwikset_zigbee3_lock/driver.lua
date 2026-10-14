@@ -682,7 +682,10 @@ local function loadState()
   local volume = persist:get("volume", nil)
   state.volume = type(volume) == "string" and volume or nil
   local oneTouch = persist:get("oneTouchLocking", nil)
-  state.oneTouchLocking = type(oneTouch) == "boolean" and oneTouch or nil
+  if type(oneTouch) ~= "boolean" then
+    oneTouch = nil
+  end
+  state.oneTouchLocking = oneTouch
   state.wrongCodeAttempts = tointeger(persist:get("wrongCodeAttempts", nil))
   state.shutoutTimer = tointeger(persist:get("shutoutTimer", nil))
   state.adminCode = persist:get("adminCode", "", true) or ""
