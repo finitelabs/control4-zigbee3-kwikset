@@ -681,7 +681,6 @@ local function loadState()
   state.autoLockSeconds = tonumber(persist:get("autoLockSeconds", nil))
   local volume = persist:get("volume", nil)
   state.volume = type(volume) == "string" and volume or nil
-  -- Not `and oneTouch or nil`: that loads a stored false as never configured.
   local oneTouch = persist:get("oneTouchLocking", nil)
   if type(oneTouch) ~= "boolean" then
     oneTouch = nil
