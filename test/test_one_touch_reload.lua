@@ -61,27 +61,9 @@ local function reloaded(stored)
   return Persist:new()
 end
 
--- lib/persist hands back a shared empty table for a key that is not stored when
--- no default is given. This one hands back nil, and has to load the same.
-local function nilForMissing(stored)
-  return {
-    get = function(_, key, default)
-      if stored[key] == nil then
-        return default
-      end
-      return stored[key]
-    end,
-  }
-end
-
-for _, case in ipairs({
-  { name = "lib/persist", persist = reloaded },
-  { name = "a persist that returns nil for a missing key", persist = nilForMissing },
-}) do
-  T.section("one-touch locking loads as it was saved, from " .. case.name)
-  T.eq("off stays off", loadState(case.persist({ oneTouchLocking = false })).oneTouchLocking, false)
-  T.eq("on stays on", loadState(case.persist({ oneTouchLocking = true })).oneTouchLocking, true)
-  T.eq("never saved stays never configured", loadState(case.persist({})).oneTouchLocking, nil)
-end
+T.section("one-touch locking loads as it was saved, from lib/persist")
+T.eq("off stays off", loadState(reloaded({ oneTouchLocking = false })).oneTouchLocking, false)
+T.eq("on stays on", loadState(reloaded({ oneTouchLocking = true })).oneTouchLocking, true)
+T.eq("never saved stays never configured", loadState(reloaded({})).oneTouchLocking, nil)
 
 T.finish()

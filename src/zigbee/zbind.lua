@@ -209,8 +209,8 @@ local function pbFields(buf)
 end
 
 --- Normalize a value to a 16-hex-digit EUI64 string, or nil if it is not one.
---- persist:get returns an empty-table sentinel (not nil) for a missing key, so a
---- cached coordinator must be validated as a real address before it is trusted.
+--- A cached coordinator may be stored as another type, so it must be validated
+--- as a real address before it is trusted.
 local function validEui(v)
   if type(v) ~= "string" then
     return nil
