@@ -1,5 +1,5 @@
---- Keeps the lock's real-time bind: the record in its binding table that makes it push
---- DoorLock operation events and reports to the coordinator.
+--- Keeps the lock's binds to the coordinator: the records in its binding table that make
+--- it push DoorLock operation events and reports, and check in.
 ---
 --- Zigbee delivers unsolicited traffic only to destinations in the device's own
 --- binding table, and a driver cannot send ZDO over SendZigbeePacket. The driver
@@ -192,8 +192,9 @@ function ZBind:save()
 end
 
 --- The list as zserver would get it now: each target it can hold that the device has
---- not refused, in the targets' order, their keys, and how it spells the coordinator:
---- as the last list did, or the other way while stale.
+--- not refused, in the targets' order and on the coordinator endpoint a target names,
+--- their keys, and how it spells the coordinator: as the last list did, or the other
+--- way while stale.
 --- @return table[] entries
 --- @return integer[] keys
 --- @return string|nil form
@@ -208,17 +209,18 @@ function ZBind:list()
   for _, t in ipairs(self.targets or {}) do
     local key = bindKey(t.srcEp, t.cluster)
     if listable(t.srcEp, t.cluster) and not self.refused[key] then
-      entries[#entries + 1] = { clusterId = t.cluster, srcEndpoint = t.srcEp, dstDeviceEuid = eui }
+      entries[#entries + 1] =
+        { clusterId = t.cluster, srcEndpoint = t.srcEp, dstEndpoint = t.dstEp, dstDeviceEuid = eui }
       keys[#keys + 1] = key
     end
   end
   return entries, keys, form
 end
 
---- Hand zserver the list of `targets` ({ srcEp, cluster }), when it differs from what
---- this session last set: Director skips a list it already holds, so the first call of
---- a session costs nothing either. `hook(settled)` hears every change of state,
---- settled once zserver has synced.
+--- Hand zserver the list of `targets` ({ srcEp, cluster }, and dstEp for a coordinator
+--- endpoint zserver is not to pick), when it differs from what this session last set:
+--- Director skips a list it already holds, so the first call of a session costs nothing
+--- either. `hook(settled)` hears every change of state, settled once zserver has synced.
 --- @param targets table[]
 --- @param hook fun(settled: boolean)|nil
 function ZBind:apply(targets, hook)

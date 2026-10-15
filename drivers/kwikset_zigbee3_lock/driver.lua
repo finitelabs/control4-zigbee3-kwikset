@@ -46,6 +46,7 @@ local EVENT_BATTERY_LOW = 4
 local PROFILE_HA = 0x0104
 local CLUSTER_BASIC = 0x0000
 local CLUSTER_POWER = 0x0001
+local CLUSTER_POLL_CONTROL = 0x0020
 local CLUSTER_DOORLOCK = 0x0101
 
 -- ZCL global command ids
@@ -2066,9 +2067,9 @@ end
 -- Real-time event bindings (Zigbee 3.0)
 -- ---------------------------------------------------------------------------
 
--- Nothing populates the lock's binding table on join, so it answers polls but
--- never pushes a keypad or thumbturn event. zbind has zserver keep the DoorLock
--- bind through the controller's Zigbee API; the status poll stays the fallback.
+-- A lock joins with no DoorLock bind, so it answers polls but never pushes a
+-- keypad or thumbturn event. zbind has zserver keep the DoorLock bind through the
+-- controller's Zigbee API; the status poll stays the fallback.
 local eventBound = false
 
 --- Make the binder, at late init: Director keeps the lock's bind list across a
@@ -2085,15 +2086,20 @@ local function makeBinder(driverInitType)
 end
 
 --- Give zserver the lock's bind list: DoorLock on its application endpoint, bound
---- to the coordinator so keypad and thumbturn actions arrive in real time. Waits
---- for the endpoint, since an entry on one the lock lacks disables the list.
+--- to the coordinator so keypad and thumbturn actions arrive in real time, then
+--- Poll Control. Waits for the endpoint, since an entry on one the lock lacks
+--- disables the list.
 function establishEventBinds()
   if not binder or not state.dstEndpointLearned then
     return
   end
-  -- Only DoorLock: the lock refuses to bind PowerConfig (seen in its binding
-  -- table), so battery stays on the hourly poll.
-  binder:apply({ { srcEp = state.dstEndpoint, cluster = CLUSTER_DOORLOCK } }, function(settled)
+  -- PowerConfig is not listed: the lock refuses its bind, so battery stays on the hourly poll.
+  binder:apply({
+    { srcEp = state.dstEndpoint, cluster = CLUSTER_DOORLOCK },
+    -- zserver unbinds what the list leaves out, so the check-in bind the lock joined with
+    -- (to the coordinator's ep1) is listed too: last, so a refusal of it comes after DoorLock is bound.
+    { srcEp = state.dstEndpoint, cluster = CLUSTER_POLL_CONTROL, dstEp = 1 },
+  }, function(settled)
     if settled and not eventBound then
       log:info("Real-time event binding in place (endpoint %d)", state.dstEndpoint)
     end

@@ -1,8 +1,8 @@
--- The lock driver's real-time bind, with the driver loaded as Director loads it.
--- An earlier build stored the coordinator it found (zbindCoordEui) and the gateway
--- endpoint it used (zbindGwEp) beside the lock's endpoint (dstEndpoint). A driver
--- update over those keys must set zserver's list at once, take the stored coordinator
--- as its own, leave zbindGwEp unread, and go on handling the lock.
+-- The lock driver's bind list, with the driver loaded as Director loads it. The store
+-- holds the lock's endpoint (dstEndpoint) and the coordinator's EUI64 (zbindCoordEui),
+-- the endpoint alone, or neither. A driver update must set zserver's list at once,
+-- take a stored coordinator as its own, keep the lock's binds to the coordinator
+-- (DoorLock, and the Poll Control it joined with), and go on handling the lock.
 --
 -- Run from the driver root:
 --   make test
@@ -30,9 +30,11 @@ local persist = require("lib.persist")
 local EUI = "00124B0001AABBCC"
 local COORD = "00124B0001CE4B21" -- the shim's coordinator
 local DOORLOCK = 0x0101
-local BOUND = "0101/2>2"
--- What an earlier build left: the lock's endpoint, its keypad verdict, and its binder's keys.
-local EARLIER = { dstEndpoint = 2, supportsUserCodes = true, keypadKnown = true, zbindCoordEui = COORD, zbindGwEp = 2 }
+local POLL_CONTROL = 0x0020
+-- The store: the lock's endpoint and keypad verdict, and the coordinator it is bound to.
+local STORED = { dstEndpoint = 2, supportsUserCodes = true, keypadKnown = true, zbindCoordEui = COORD }
+-- The endpoint and keypad verdict alone, no coordinator.
+local NO_COORD = { dstEndpoint = 2, supportsUserCodes = true, keypadKnown = true }
 
 -- The controller's lookups for this lock; the binder normalises the address.
 function C4:FindEuidBasedOnNodeId()
@@ -76,15 +78,35 @@ local function tableOf(ctl)
   return table.concat(out, ",")
 end
 
+--- Director's copy of the list as "cluster/srcEp>dstEp" strings, "-" for an endpoint
+--- left to zserver and "@EUI64" for a coordinator named.
+local function listOf(ctl)
+  local out = {}
+  for _, e in ipairs(ctl.list or {}) do
+    out[#out + 1] = string.format("%04X/%d>%s", e.clusterId, e.srcEndpoint, e.dstEndpoint or "-")
+      .. (e.dstDeviceEuid and "@" .. e.dstDeviceEuid or "")
+  end
+  return table.concat(out, ",")
+end
+
 --- A binding-table record as the lock holds it.
 local function rec(cluster, dstEp)
   return { clusterId = cluster, srcEndpoint = 2, dstEndpoint = dstEp, dstDeviceEuid = COORD }
 end
 
+--- The table the Kwikset locks on a 4.3.0 controller held: Poll Control from ep2 to the
+--- coordinator's ep1, and DoorLock from ep2 to its ep2.
+local function joined()
+  return { rec(POLL_CONTROL, 1), rec(DOORLOCK, 2) }
+end
+local JOINED = "0020/2>1,0101/2>2"
+-- What zserver binds, in list order, on a lock that holds neither.
+local BOUND = "0101/2>2,0020/2>1"
+
 local seeded = {}
 --- Load the driver as Director does after `initType`, over a store holding `seed` and a
---- lock whose binding table holds `records`.
-local function start(seed, records, initType)
+--- lock whose binding table holds `records`; `before(ctl)` readies the controller first.
+local function start(seed, records, initType, before)
   KillAllTimers()
   ShimPersistLand()
   for k in pairs(persist._persist) do
@@ -103,6 +125,9 @@ local function start(seed, records, initType)
   local ctl = ShimInstallZigbeeV2()
   for i, r in ipairs(records) do
     ctl.table[i] = r
+  end
+  if before then
+    before(ctl)
   end
   T.unload("^zigbee%.")
   ShimResetZigbeePackets()
@@ -140,20 +165,24 @@ local KEYPAD_LOCK = string.char(0x09, 0x10, 0x20, 0x00, 0x01, 0x03, 0x00, 0x00, 
 local LOCK_STATE_LOCKED = string.char(0x18, 0x01, 0x01, 0x00, 0x00, 0x00, 0x30, 0x01)
 
 --------------------------------------------------------------------------------
-T.section("a driver update over an earlier build's keys: the list goes at once")
+T.section("a driver update over a stored coordinator: the list goes at once, and keeps both binds")
 --------------------------------------------------------------------------------
 do
-  local ctl = start(EARLIER, { rec(DOORLOCK, 2) }, "DIT_UPDATING")
+  local ctl = start(STORED, joined(), "DIT_UPDATING")
+  -- Naming no coordinator: Director keeps the list across an update.
   check(
-    "late init set DoorLock on the stored endpoint",
-    ctl.syncs == 1 and #ctl.list == 1 and ctl.list[1].clusterId == DOORLOCK and ctl.list[1].srcEndpoint == 2
+    "late init set DoorLock, then Poll Control to the coordinator's ep1, from the stored endpoint",
+    ctl.syncs == 1 and listOf(ctl) == "0101/2>-,0020/2>1",
+    listOf(ctl)
   )
-  check("naming no destination: Director keeps the list across an update", ctl.list[1].dstDeviceEuid == nil)
   ctl.deliver()
-  check("zserver found the bind already in the table, and kept it", tableOf(ctl) == BOUND and ctl.state == "synced")
+  check(
+    "zserver found both binds in the table, and kept them",
+    tableOf(ctl) == JOINED and ctl.state == "synced",
+    tableOf(ctl)
+  )
   check("nothing was read: the stored coordinator is taken", #ctl.issued == 0)
   check("which stays as it was", stored("zbindCoordEui") == COORD)
-  check("zbindGwEp is left as it was, unread", stored("zbindGwEp") == 2)
   local list = stored("zbindList")
   check("the list's record is kept for this lock", type(list) == "table" and list.eui == EUI and list.state == "synced")
 
@@ -174,35 +203,43 @@ do
 end
 
 --------------------------------------------------------------------------------
-T.section("a driver update over an earlier build's keys, the bind gone from the lock")
+T.section("a driver update over a stored coordinator, the binds gone from the lock")
 --------------------------------------------------------------------------------
 do
-  local ctl = start(EARLIER, {}, "DIT_UPDATING")
+  local ctl = start(STORED, {}, "DIT_UPDATING")
   ctl.deliver()
-  check("zserver binds DoorLock", tableOf(ctl) == BOUND and ctl.state == "synced", tableOf(ctl))
+  check(
+    "zserver binds DoorLock, then Poll Control at the coordinator's ep1",
+    tableOf(ctl) == BOUND and ctl.state == "synced",
+    tableOf(ctl)
+  )
   check("and nothing is read", #ctl.issued == 0)
 end
 
 --------------------------------------------------------------------------------
-T.section("a driver update over an earlier build that had dropped its coordinator")
+T.section("a driver update over the binds a lock joined with, no coordinator stored")
 --------------------------------------------------------------------------------
 do
-  -- That build deleted both of its keys after an attempt that failed.
-  local ctl = start({ dstEndpoint = 2, supportsUserCodes = true, keypadKnown = true }, {}, "DIT_UPDATING")
+  -- The store holds the endpoint but no coordinator: a table read after synced names it.
+  local ctl = start(NO_COORD, joined(), "DIT_UPDATING")
   ctl.deliver()
-  check("zserver binds DoorLock", tableOf(ctl) == BOUND and ctl.state == "synced", tableOf(ctl))
+  check("the first sync keeps both binds", tableOf(ctl) == JOINED and ctl.state == "synced", tableOf(ctl))
   check("and the table is read once for the coordinator", #ctl.issued == 1 and stored("zbindCoordEui") == COORD)
 end
 
 --------------------------------------------------------------------------------
-T.section("a controller reboot over an earlier build's keys names the stored coordinator")
+T.section("a controller reboot over a stored coordinator names it")
 --------------------------------------------------------------------------------
 do
   -- Director then holds no list for the lock, so one naming the coordinator is sent.
-  local ctl = start(EARLIER, { rec(DOORLOCK, 2) }, "DIT_STARTUP")
-  check("the list names the stored coordinator", ctl.syncs == 1 and ctl.list[1].dstDeviceEuid == COORD)
+  local ctl = start(STORED, joined(), "DIT_STARTUP")
+  check(
+    "the list names the stored coordinator",
+    ctl.syncs == 1 and listOf(ctl) == "0101/2>-@" .. COORD .. ",0020/2>1@" .. COORD,
+    listOf(ctl)
+  )
   ctl.deliver()
-  check("and zserver keeps the bind", tableOf(ctl) == BOUND and ctl.state == "synced")
+  check("and zserver keeps both binds", tableOf(ctl) == JOINED and ctl.state == "synced", tableOf(ctl))
 end
 
 --------------------------------------------------------------------------------
@@ -212,9 +249,13 @@ do
   local ctl = start({}, {}, "DIT_ADDING")
   check("no endpoint learned: no list", ctl.calls.SetZdoBindConfig == nil)
   OnZigbeePacketIn(LOCK_STATE_LOCKED, 0x0104, DOORLOCK, 0, 2, 1)
-  check("the lock answers from ep2: DoorLock listed there", ctl.syncs == 1 and ctl.list[1].srcEndpoint == 2)
+  check(
+    "the lock answers from ep2: both listed there",
+    ctl.syncs == 1 and listOf(ctl) == "0101/2>-,0020/2>1",
+    listOf(ctl)
+  )
   ctl.deliver()
-  check("zserver binds it", tableOf(ctl) == BOUND, tableOf(ctl))
+  check("zserver binds them", tableOf(ctl) == BOUND, tableOf(ctl))
   -- A new driver's list may not be the one zserver syncs: its synced stands once none follows.
   check("its synced waits to stand", Timer.ZBindSettle ~= nil and #ctl.issued == 0)
   fire("ZBindSettle")
@@ -224,10 +265,68 @@ do
 end
 
 --------------------------------------------------------------------------------
+T.section("a lock that refuses the Poll Control bind keeps DoorLock")
+--------------------------------------------------------------------------------
+do
+  local ctl = start(STORED, {}, "DIT_UPDATING", function(c)
+    c.answers[2 * 65536 + POLL_CONTROL] = 0x84 -- NOT_SUPPORTED, which disables the list
+  end)
+  ctl.deliver(2) -- pending, then zserver's sync
+  check(
+    "the sync bound DoorLock before the refusal disabled the list",
+    tableOf(ctl) == "0101/2>2" and ctl.state == "disabled",
+    tableOf(ctl)
+  )
+  ctl.deliver()
+  local list = stored("zbindList")
+  check(
+    "the table named Poll Control as refused",
+    type(list) == "table" and #list.refused == 1 and list.refused[1] == 2 * 65536 + POLL_CONTROL
+  )
+  check("and the list without it synced", listOf(ctl) == "0101/2>-" and ctl.state == "synced", listOf(ctl))
+  check("DoorLock still bound", tableOf(ctl) == "0101/2>2", tableOf(ctl))
+end
+
+--------------------------------------------------------------------------------
+T.section("a frame after a table read that timed out reads it again")
+--------------------------------------------------------------------------------
+do
+  local ctl = start(NO_COORD, joined(), "DIT_UPDATING")
+  ctl.deliver(2) -- pending, then zserver's sync
+  check("synced, and the read for the coordinator is out", ctl.state == "synced" and #ctl.issued == 1)
+  ctl.silence()
+  fire("ZV2Read")
+  check("no page came, and nothing reads again on its own", #ctl.issued == 1 and Timer.ZV2Read == nil)
+  OnZigbeePacketIn(LOCK_STATE_LOCKED, 0x0104, DOORLOCK, 0, 2, 1)
+  check("the lock's next frame reads it again", #ctl.issued == 2)
+  ctl.deliver()
+  check("and that read names the coordinator", stored("zbindCoordEui") == COORD)
+end
+
+--------------------------------------------------------------------------------
+T.section("ONLINE after a Set refused before Director added the lock sets the list at once")
+--------------------------------------------------------------------------------
+do
+  local ctl = start(STORED, joined(), "DIT_STARTUP", function(c)
+    c.known = false
+  end)
+  check(
+    "refused as not found: nothing set, a retry armed",
+    ctl.syncs == 0 and #ctl.invalid == 1 and Timer.ZBindApply ~= nil
+  )
+  ctl.known = true
+  ctl.online() -- Director adds the lock, then the driver hears it ONLINE
+  OnZigbeeOnlineStatusChanged("ONLINE", "", "")
+  check("ONLINE sets it without waiting for the retry", ctl.syncs == 1 and Timer.ZBindApply == nil)
+  ctl.deliver()
+  check("and zserver keeps both binds", tableOf(ctl) == JOINED and ctl.state == "synced", tableOf(ctl))
+end
+
+--------------------------------------------------------------------------------
 T.section("a rejoin has the binder look at the lock's table")
 --------------------------------------------------------------------------------
 do
-  local ctl = start(EARLIER, { rec(DOORLOCK, 2) }, "DIT_UPDATING")
+  local ctl = start(STORED, joined(), "DIT_UPDATING")
   ctl.deliver()
   OnZigbeeOnlineStatusChanged("ONLINE", "", "")
   check("a first ONLINE is no rejoin", Timer.ZBindCheck == nil)
