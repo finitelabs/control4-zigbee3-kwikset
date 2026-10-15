@@ -676,8 +676,8 @@ local function loadState()
   end
   state.users = persist:get("users", {}, true) or {}
   -- Lock-side settings: absent means "never configured" (adopt from the lock).
-  -- persist:get(key, nil) returns an internal sentinel table for absent keys,
-  -- so every load type-checks its value to keep "never configured" nil.
+  -- Every load type-checks its value, so one stored as another type also
+  -- reads as never configured.
   state.autoLockSeconds = tonumber(persist:get("autoLockSeconds", nil))
   local volume = persist:get("volume", nil)
   state.volume = type(volume) == "string" and volume or nil
