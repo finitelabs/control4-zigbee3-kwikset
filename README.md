@@ -292,9 +292,7 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 ### Changed
 
 - Changed the lock's real-time binding to go through the controller's Zigbee
-  API, so keypad, thumbturn, and one-touch operations show as they happen on OS
-  4.3
-- Changed the minimum Control4 OS to 4.3.0
+  API, so keypad, thumbturn, and one-touch operations show as they happen
 
 ## v20260825 - 2026-08-25
 
