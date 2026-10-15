@@ -1,91 +1,63 @@
--- Regression test for src/zigbee/zbind.lua: the bind bootstrap's read-back
--- verify and its broker-close handling in drain().
+-- The lock's bind list in src/zigbee/zbind.lua, over src/zigbee/zv2.lua and the
+-- ZigbeeV2 shim in c4_local.lua, which plays zserver, Director and the device as a
+-- 4.3.0 controller was measured to (test_zv2.lua holds the shim to those measurements).
 --
 -- Run from the driver root:
 --   make test
 -- or:
---   LUA_PATH="$PWD/test/?.lua;$PWD/src/?.lua;$PWD/src/?/init.lua;$PWD/vendor/?.lua;$PWD/vendor/?/init.lua;;" \
---     luajit -e "require('c4_shim')" test/test_zbind.lua
+--   ./test/run_test.sh test_zbind.lua
 --
--- After sending the binds the flow reads the device binding table back
--- (Mgmt_Bind_rsp) and re-issues any target cluster that is not present, then
--- settles. Two properties have to hold across every variant of that:
---   1. Verify converges: all targets present -> finish(true) with the coordinator
---      cache kept; a missing cluster is re-fired and re-checked after a settle;
---      and the retry is bounded so a cluster that never lands still settles.
---   2. The final read can carry a broker close in the same recv(), so a
---      completing frame must be parsed before the flow settles, and an
---      incomplete one must settle (not strand the callback): a wrong settle
---      either leaves every later ensureBinds short-circuiting on the idle guard
---      or forces a needless full re-discovery.
---   3. Verify confirms the exact bind requested - (srcEp, cluster) to the
---      coordinator at the probed gateway endpoint - so a same-cluster bind on
---      another endpoint, or one to another node, does not read as landed.
---
--- Cases:
---   1. table shows every target bound      -> finish(true), cache kept
---   2. table missing one cluster, present  -> re-fire, finish(true)
---      on the re-read after the settle
---   3. a cluster never appears             -> bounded retries, still finish(true)
---   4. completing table with the close     -> parse then finish(true), cache kept
---   5. close carries a truncated table     -> finish(false), cache dropped
---   6. close carries no bytes              -> drain does not settle; the step
---      timeout rescues as finish(false)
---   7. same cluster on a different source endpoint  -> re-fire, not confirm
---   8. bind at a different gateway endpoint          -> re-fire, not confirm
---   9. record omits the endpoint field              -> still confirm
---  10. bind to a different destination node          -> re-fire, not confirm
-
-local T = require("testlib")
+-- The paths a lock takes:
+--   1. A fresh pair: the list is set, zserver syncs it, and the coordinator is read
+--      from the table once, after zserver's own read.
+--   2. A reload: an unchanged list costs nothing, and a moved endpoint is set again;
+--      another device's record is not taken.
+--   3. A Director restart: the list is set again as soon as Director has the device,
+--      the coordinator spelled the other way so Director sends it, replacing the empty
+--      list Director pushes before zserver acts on it; a state other than pending is
+--      taken once none follows it, since the one zserver kept and the empty list's
+--      come first.
+--   4. A disabled list: the table names the DoorLock bind the lock refused, which is
+--      then left to the status poll; a table holding anything else names none.
+--   5. A rejoin: a lock that came back with an empty table gets its list again, the
+--      coordinator spelled the other way so Director sends it.
+--   6. A read that got no page is asked again when the lock next speaks, and a list
+--      zserver leaves pending is set again two hours after a frame.
+--   7. Nothing is read while zserver syncs (the last section checks every path above),
+--      no list is set while a read is out, and what the list cannot hold is never sent.
 
 require("c4_shim")
+require("c4_local") -- driver-local seams, including the ZigbeeV2 shim
+require("drivers-common-public.global.timer") -- Timer / TimerFunctions / KillAllTimers
 
--- Not provided by the shim; the flow reads both during connect()/ensureBinds().
-function C4:GetUniqueMAC()
-  return "0022A30012ABCDEF"
-end
-function C4:GetTime()
-  return 1700000000000
-end
-
--- Inject a fake unix socket before requiring the module, so connect() binds to a
--- scripted receive() instead of a real broker. `currentFake` is swapped per case.
-local currentFake
-package.loaded["socket.unix"] = {
-  stream = function()
-    return currentFake
-  end,
-}
-
-local ZBind = require("zigbee.zbind")
-
--- Swap persistence for an in-memory store so the cache-kept / cache-dropped
--- contract can be asserted directly, independent of the real serializer.
+-- The binder runs over the real lib.persist and the shim's C4 store, so what is kept
+-- is what a reload reads back. The store reads a write back only after the call that
+-- made it, so every place the test stands between two calls lands the writes.
 local persist = require("lib.persist")
-local store = {}
+local seeded = {}
+--- Seed the store as a load finds it, with lib.persist's cache emptied.
 local function setStore(t)
-  for k in pairs(store) do
-    store[k] = nil
+  ShimPersistLand()
+  for k in pairs(persist._persist) do
+    seeded[k] = true
   end
+  for k in pairs(seeded) do
+    C4:PersistDeleteValue(k)
+  end
+  seeded = {}
   for k, v in pairs(t or {}) do
-    store[k] = v
+    seeded[k] = true
+    C4:PersistSetValue(k, Serialize(v), false)
   end
+  ShimPersistLand()
+  persist._persist = {}
 end
-function persist.get(_, key, default)
-  local v = store[key]
-  if v == nil then
-    return default
-  end
-  return v
-end
-function persist.set(_, key, value)
-  store[key] = value
-end
-function persist.delete(_, key)
-  store[key] = nil
+--- What the store holds under a key, as lib.persist decodes it.
+local function stored(key)
+  ShimPersistLand()
+  return Deserialize(C4:PersistGetValue(key, false))
 end
 
--- The flow logs on nearly every step; silence it so results are readable.
 local logging = require("lib.logging")
 for _, m in ipairs({ "trace", "debug", "info", "warn", "error" }) do
   if type(logging[m]) == "function" then
@@ -93,431 +65,772 @@ for _, m in ipairs({ "trace", "debug", "info", "warn", "error" }) do
   end
 end
 
--- Minimal wire encoders, only enough to hand-build the frames the flow reads.
-local function mqLen(n)
-  local o = {}
-  repeat
-    local b = n % 128
-    n = math.floor(n / 128)
-    if n > 0 then
-      b = b + 128
-    end
-    o[#o + 1] = string.char(b)
-  until n == 0
-  return table.concat(o)
-end
-local function mqStr(s)
-  return string.char(math.floor(#s / 256) % 256, #s % 256) .. s
-end
-local function pbVarint(n)
-  local o = {}
-  repeat
-    local b = n % 128
-    n = math.floor(n / 128)
-    if n > 0 then
-      b = b + 128
-    end
-    o[#o + 1] = string.char(b)
-  until n == 0
-  return table.concat(o)
-end
-local function pbVI(field, v)
-  return pbVarint(field * 8 + 0) .. pbVarint(v)
-end
-local function pbLD(field, data)
-  return pbVarint(field * 8 + 2) .. pbVarint(#data) .. data
-end
--- An EUI64 as a fixed64 in 8 little-endian bytes, matching the module's encoder
--- so its hexLE() decodes the field back to the same address.
-local function pbF64(field, hex)
-  hex = tostring(hex or ""):gsub("[^%x]", "")
-  while #hex < 16 do
-    hex = "0" .. hex
-  end
-  local b = {}
-  for i = 1, 16, 2 do
-    b[#b + 1] = tonumber(hex:sub(i, i + 1), 16) or 0
-  end
-  local o = {}
-  for i = 8, 1, -1 do
-    o[#o + 1] = string.char(b[i])
-  end
-  return pbVarint(field * 8 + 1) .. table.concat(o)
-end
-
-local CONNACK = string.char(0x20, 0x02, 0x00, 0x00)
-
-local function publish(topic, payload)
-  local body = mqStr(topic) .. payload
-  return string.char(0x30) .. mqLen(#body) .. body
-end
-
--- Handlers match only the topic suffix, so literal MAC/EUI segments are fine.
-local BASE = "s1/c4/protected/zigbee3-public-api/v1/MAC/device/EUI"
--- exec-status/send-zdo carrying EXEC_OK (0): any{ 2: msg{ 2: 0 } }.
-local EXEC_OK_PUBLISH = publish(BASE .. "/exec-status/send-zdo", pbLD(2, pbVI(2, 0)))
-
--- A PUBLISH header claiming 127 more bytes than are present: parse() cannot
--- complete a packet, so it consumes nothing and the flow stays mid-step.
-local TRUNCATED = string.char(0x30, 0x7F) .. string.char(0, 0, 0)
+local T = require("testlib")
+local check = T.check
 
 local EUI = "00124B0001AABBCC"
-local COORD = "00124B0001CE4B21"
-local GW_EP = 2
-local CL_DOORLOCK = 0x0101
-local CL_POWER = 0x0001
-local CLUSTERS = { { cluster = CL_DOORLOCK, srcEp = 1 }, { cluster = CL_POWER, srcEp = 1 } }
+local COORD = "00124B0001CE4B21" -- the shim's coordinator
+local DOORLOCK = 0x0101
+-- The lock's DoorLock on its application endpoint, as the driver lists it.
+local TARGETS = { { srcEp = 2, cluster = DOORLOCK } }
+-- zserver binds it at the coordinator endpoint that models locks.
+local BOUND = "0101/2>2"
+-- An earlier load set this lock's list.
+local SET_BEFORE = { zbindList = { eui = EUI } }
+local function key(srcEp, cluster)
+  return srcEp * 65536 + cluster
+end
 
--- One binding-table record (repeated field 5): { 2=srcEp, 3=cluster, 5=dstEui,
--- 6=dstEp }. dstEp defaults to the probed gateway endpoint; pass false to omit
--- field 6 entirely, modelling a firmware that does not enumerate it.
-local function bindRecord(srcEp, cluster, dstHex, dstEp)
-  local rec = pbVI(2, srcEp) .. pbVI(3, cluster) .. pbF64(5, dstHex)
-  if dstEp ~= false then
-    rec = rec .. pbVI(6, dstEp or GW_EP)
+--- A binding-table record as the device holds it.
+local function rec(cluster, dstEp, dst, srcEp)
+  return { clusterId = cluster, srcEndpoint = srcEp or 2, dstEndpoint = dstEp, dstDeviceEuid = dst or COORD }
+end
+
+--- The device's table as "cluster/srcEp>dstEp" strings, in table order.
+local function tableOf(ctl)
+  local out = {}
+  for _, b in ipairs(ctl.table) do
+    out[#out + 1] = string.format("%04X/%d>%d", b.clusterId, b.srcEndpoint, b.dstEndpoint)
+      .. (b.dstDeviceEuid == COORD and "" or "@" .. b.dstDeviceEuid)
   end
-  return pbLD(5, rec)
-end
--- Wrap a binding table as the incoming-zdo PUBLISH the verify step reads. The
--- ZDO response buffer the flow parses sits at command-frame field 8, nested as
--- any{2} -> msg{8} -> frame{3} -> cf{8}.
-local function incomingZdo(tableBuf)
-  return publish(BASE .. "/event/incoming-zdo", pbLD(2, pbLD(8, pbLD(3, pbLD(8, tableBuf)))))
-end
-local TABLE_BOTH = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD) .. bindRecord(1, CL_POWER, COORD))
-local TABLE_DOORLOCK_ONLY = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD))
--- Both target clusters are bound to the coordinator, but on a different source
--- endpoint (99) than the targets ask for (1): must not count as our bind.
-local TABLE_WRONG_EP = incomingZdo(bindRecord(99, CL_DOORLOCK, COORD) .. bindRecord(99, CL_POWER, COORD))
--- Both target clusters bound to the coordinator, but at a different gateway
--- (destination) endpoint than the flow probed: also must not count as our bind.
-local TABLE_WRONG_DSTEP =
-  incomingZdo(bindRecord(1, CL_DOORLOCK, COORD, GW_EP + 1) .. bindRecord(1, CL_POWER, COORD, GW_EP + 1))
--- Both target clusters bound to the coordinator with no destination-endpoint
--- field at all (a firmware that does not enumerate it): must still confirm.
-local TABLE_NO_DSTEP = incomingZdo(bindRecord(1, CL_DOORLOCK, COORD, false) .. bindRecord(1, CL_POWER, COORD, false))
--- A destination EUI that is not the coordinator, derived from COORD so it cannot
--- collide with it. Both clusters bound on the right source endpoint but to this
--- other node: must not count as our bind.
-local OTHER_EUI = (COORD:gsub("%x%x$", "99"))
-local TABLE_WRONG_DST = incomingZdo(bindRecord(1, CL_DOORLOCK, OTHER_EUI) .. bindRecord(1, CL_POWER, OTHER_EUI))
-
--- Scripted socket. receive() replays {data, err, partial} triples in order; once
--- the script is exhausted it reports a would-block so drain()'s loop breaks.
-local function fakeSocket(script)
-  return {
-    _i = 0,
-    _script = script,
-    sent = {},
-    connect = function()
-      return 1
-    end,
-    settimeout = function() end,
-    send = function(self, pkt)
-      self.sent[#self.sent + 1] = pkt
-      return #pkt
-    end,
-    close = function(self)
-      self.closed = true
-    end,
-    receive = function(self)
-      self._i = self._i + 1
-      local step = self._script[self._i]
-      if not step then
-        return nil, "timeout", ""
-      end
-      return step[1], step[2], step[3]
-    end,
-  }
+  return table.concat(out, ",")
 end
 
-local function publishCount(sock)
-  local n = 0
-  for _, pkt in ipairs(sock.sent) do
-    if #pkt > 0 and string.byte(pkt, 1) == 0x30 then
-      n = n + 1
-    end
+--- A set of keys as "k,k", sorted.
+local function keys(set)
+  local out = {}
+  for k in pairs(set or {}) do
+    out[#out + 1] = k
   end
-  return n
+  table.sort(out)
+  return table.concat(out, ",")
 end
 
--- Drive a fresh flow to the point where the binds are sent and the verify read
--- is armed, awaiting the binding table. The cached coordinator/endpoint let it
--- skip discovery and go straight to the probe. The recurring drain timer is
--- cancelled so ShimFireTimers only advances the settle/step timers and the test
--- feeds socket data through explicit drain() calls.
-local function runToVerify(script)
-  currentFake = fakeSocket(script)
-  setStore({ zbindCoordEui = COORD, zbindGwEp = GW_EP })
-  local rec = { count = 0, ok = nil }
-  local zb = ZBind:new()
-  zb:ensureBinds(EUI, CLUSTERS, function(ok)
-    rec.count = rec.count + 1
-    rec.ok = ok
+-- The delay each named timer was last armed with.
+local armedFor = {}
+do
+  local set = SetTimer
+  SetTimer = function(id, delay, ...)
+    armedFor[id] = delay
+    return set(id, delay, ...)
+  end
+end
+
+--- Fire one named timer now, as its expiry would.
+local function fire(name)
+  local h = Timer[name]
+  if h == nil then
+    return false
+  end
+  local fn = TimerFunctions[h]
+  CancelTimer(name)
+  ShimPersistLand()
+  fn(h, 0)
+  return true
+end
+
+--- The driver's modules loaded again, as a reload has them; the controller stays.
+local function load()
+  KillAllTimers()
+  T.unload("^zigbee%.")
+  return require("zigbee.zbind")
+end
+
+-- Every controller fresh() made, for the last section.
+local controllers = {}
+
+--- A newly loaded driver over a store seeded with `seed` and a device holding `records`.
+local function fresh(seed, records)
+  setStore(seed)
+  local ctl = ShimInstallZigbeeV2()
+  controllers[#controllers + 1] = ctl
+  for i, r in ipairs(records or {}) do
+    ctl.table[i] = r
+  end
+  return ctl, load()
+end
+
+--- The driver loaded again over what the last load stored.
+local function reload()
+  ShimPersistLand()
+  persist._persist = {}
+  return load()
+end
+
+--- A binder for the device at `eui` (EUI by default) on controller 20, as the driver
+--- makes it, `stale` after a load that was not a driver update; `heard` gets each
+--- hook's settled flag.
+local function binder(ZBind, eui, stale)
+  local zb = ZBind:new(stale)
+  zb.address = function()
+    return eui or EUI
+  end
+  zb.zserverId = function()
+    return 20
+  end
+  local heard = {}
+  zb.hookFn = function(settled)
+    heard[#heard + 1] = tostring(settled)
+  end
+  return zb, heard
+end
+
+--- Apply `targets` (TARGETS by default) as the driver does.
+local function apply(zb, targets)
+  zb:apply(targets or TARGETS, zb.hookFn)
+end
+
+--- The table reads the driver sent, as their StartIndex, comma-joined.
+local function reads(ctl)
+  local out = {}
+  for _, c in ipairs(ctl.issued) do
+    out[#out + 1] = tostring(c.startIndex)
+  end
+  return table.concat(out, ",")
+end
+
+--------------------------------------------------------------------------------
+T.section("a fresh pair: the list is set, zserver syncs it, and the table names the coordinator")
+--------------------------------------------------------------------------------
+do
+  local ctl, ZBind = fresh()
+  local zb, heard = binder(ZBind)
+  apply(zb)
+  check(
+    "the list went: DoorLock on the lock's endpoint",
+    ctl.syncs == 1 and #ctl.list == 1 and ctl.list[1].clusterId == DOORLOCK and ctl.list[1].srcEndpoint == 2
+  )
+  check(
+    "with no destination: zserver fills in the coordinator",
+    ctl.list[1].dstEndpoint == nil and ctl.list[1].dstDeviceEuid == nil
+  )
+  check("with no coordinator known, nothing is read before zserver has synced", #ctl.issued == 0)
+  ctl.deliver(1)
+  check("pending", zb.state == "pending" and heard[1] == "false", zb.state)
+  ctl.deliver(1) -- zserver's sync
+  check("zserver bound DoorLock at the coordinator's ep2", tableOf(ctl) == BOUND, tableOf(ctl))
+  check("synced, and the table read once, after zserver's own read", zb.state == "synced" and reads(ctl) == "0")
+  ctl.deliver()
+  check("the coordinator the listed record names", zb:coordinator() == COORD, tostring(zb:coordinator()))
+  check("kept, with its controller", stored("zbindCoordEui") == COORD and stored("zbindCoordZserver") == 20)
+  check(
+    "the hook heard pending, synced, and the read's end, settled",
+    table.concat(heard, ",") == "false,true,true",
+    table.concat(heard, ",")
+  )
+  local list = stored("zbindList")
+  check("the list's record is kept for this lock", list.eui == EUI and #list.refused == 0 and list.state == "synced")
+  check("no read left in flight", zb.walking == nil and #ctl.queue == 0)
+end
+
+--------------------------------------------------------------------------------
+T.section("a reload: an unchanged list costs nothing, and a moved endpoint is set again")
+--------------------------------------------------------------------------------
+do
+  local ctl, ZBind = fresh()
+  local zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver()
+  ZBind = reload()
+  local again, heard = binder(ZBind)
+  check("the last load's state shows once the address is known", again:known() == EUI and again.state == "synced")
+  local calls, syncs = ctl.calls.SetZdoBindConfig, ctl.syncs
+  apply(again)
+  check("the list is set again, and Director skips it", ctl.calls.SetZdoBindConfig == calls + 1 and ctl.syncs == syncs)
+  check("so no state comes, and nothing is read", #ctl.queue == 0 and #heard == 0 and reads(ctl) == "0")
+  apply(again)
+  check("the same list later in the session is not set at all", ctl.calls.SetZdoBindConfig == calls + 1)
+  apply(again, { { srcEp = 1, cluster = DOORLOCK } })
+  ctl.deliver()
+  check(
+    "the lock's endpoint learned anew: the list moves with it",
+    ctl.syncs == syncs + 1 and tableOf(ctl) == "0101/1>2" and again.state == "synced",
+    tableOf(ctl)
+  )
+
+  -- A re-pair: the record names the device it was kept for.
+  ZBind = reload()
+  local other = binder(ZBind, "00124B0001DDEEFF")
+  other:known()
+  check("another device's record is not taken", other.state == nil and next(other.refused) == nil)
+end
+
+--------------------------------------------------------------------------------
+T.section("a Director restart: the list is set again, spelled the other way, once Director has the device")
+--------------------------------------------------------------------------------
+do
+  -- Director lost its lists; the driver's calls failed until addZ3Node, where Director
+  -- pushed an empty list, and the driver's Set 0.4 to 1 s later was compared with the
+  -- list zserver published before it, so it was skipped.
+  local ctl, ZBind = fresh({ zbindCoordEui = COORD })
+  local zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver()
+  check("bound, and nothing read: the coordinator was known", tableOf(ctl) == BOUND and reads(ctl) == "")
+  ctl.restart()
+  ZBind = reload()
+  local again = binder(ZBind, nil, true)
+  apply(again)
+  check("not found: tried again in a second", armedFor.ZBindApply == 1000 and Timer.ZBindApply ~= nil)
+  fire("ZBindApply")
+  check("and again", armedFor.ZBindApply == 1000 and Timer.ZBindApply ~= nil)
+  again.retrySince = again.retrySince - 301
+  fire("ZBindApply")
+  check("every minute once five have passed", armedFor.ZBindApply == 60000)
+  ctl.known = true
+  ctl.online() -- Director's empty list at addZ3Node, not yet published
+  fire("ZBindApply")
+  check(
+    "the next try sets the list, the coordinator spelled out, so Director sends it",
+    ctl.syncs == 3 and ctl.list[1].dstDeviceEuid == COORD and Timer.ZBindApply == nil
+  )
+  check("and no state is taken for it until one comes", Timer.ZBindSettle == nil and again.state == nil)
+  -- The synced zserver kept for the list before came first, then the empty list's
+  -- pending and this list's; a sleepy device's own sync waits for its wake. Each
+  -- device's ONLINE added it again first, and Director sent this list once more.
+  ctl.asleep = true
+  ctl.deliver()
+  check("the second add sends this list again: one pending more", ctl.syncs == 4 and #ctl.queue == 1, ctl.syncs)
+  check(
+    "the synced zserver kept is not this list's: pending",
+    again.state == "pending" and Timer.ZBindSettle == nil,
+    tostring(again.state)
+  )
+  ctl.asleep = false
+  ctl.deliver()
+  check("which replaced the empty one before zserver acted on it: nothing was unbound", tableOf(ctl) == BOUND)
+  check("its synced is taken once no state follows it", again.state == "pending" and armedFor.ZBindSettle == 10000)
+  fire("ZBindSettle")
+  check("synced", again.state == "synced")
+  check("and kept as spelled, so the next restart spells it the other way", stored("zbindList").form == "upper")
+
+  -- Director's own states before the list goes are not the driver's.
+  ctl.restart()
+  ZBind = reload()
+  local later, heard = binder(ZBind, nil, true)
+  apply(later)
+  ctl.known = true
+  ctl.online()
+  ctl.deliver(3) -- the second add, the synced zserver kept, and the empty list's pending
+  check(
+    "Director's own pending shows, after the synced zserver kept",
+    later.state == "pending" and table.concat(heard, ",") == "false,false",
+    table.concat(heard, ",")
+  )
+  later:wake()
+  later.pendingHeard = os.time() - 7200
+  later:wake()
+  check("and is not the driver's to set again", ctl.syncs == 6)
+  local n = #ctl.issued
+  ctl.cb().config({ state = "synced" }) -- as if its empty list had synced
+  check("nor is anything read for it", #ctl.issued == n)
+  fire("ZBindApply")
+  ctl.deliver()
+  check("the list set then is spelled in lower case", ctl.syncs == 7 and ctl.list[1].dstDeviceEuid == COORD:lower())
+  check("and replaces the empty one", tableOf(ctl) == BOUND, tableOf(ctl))
+
+  -- A driver update before Director has the device: its Set is refused as well.
+  ctl.restart()
+  ZBind = reload()
+  local early = binder(ZBind)
+  apply(early)
+  ctl.known = true
+  ctl.online()
+  fire("ZBindApply")
+  ctl.deliver()
+  check(
+    "a Set refused after a driver update is spelled the other way too",
+    ctl.syncs == 10 and ctl.list[1].dstDeviceEuid == COORD and tableOf(ctl) == BOUND,
+    tableOf(ctl)
+  )
+
+  -- After a reboot an unknown can come between the Set and its pending, and the empty
+  -- list could end, synced or disabled, before zserver takes this one: none is this list's.
+  ctl.restart()
+  ZBind = reload()
+  local held, heardHeld = binder(ZBind, nil, true)
+  apply(held)
+  ctl.known = true
+  ctl.online()
+  fire("ZBindApply")
+  ctl.cb().config({ state = "unknown" })
+  check("an unknown after the Set does not show", held.state == nil and #heardHeld == 0)
+  ctl.deliver(3) -- the second add, the synced zserver kept, then the empty list's pending
+  ctl.cb().config({ state = "synced" })
+  ctl.cb().config({ state = "disabled" })
+  ctl.deliver(1) -- this list's
+  check(
+    "nor the empty list's end: pending, and no read while zserver syncs",
+    held.state == "pending" and not ctl.corrupted
+  )
+  ctl.deliver()
+  fire("ZBindSettle")
+  check("this list's own synced is", held.state == "synced" and tableOf(ctl) == BOUND)
+
+  -- With no coordinator known it cannot be spelled another way: Director skips it, and
+  -- zserver syncs the empty list.
+  ctl, ZBind = fresh(SET_BEFORE)
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  ctl.silence()
+  fire("ZV2Read")
+  ctl.restart()
+  local ZBind2 = reload()
+  local stale = binder(ZBind2, nil, true)
+  apply(stale)
+  ctl.known = true
+  ctl.online()
+  fire("ZBindApply")
+  check(
+    "no coordinator known: the list goes as it was, and is skipped",
+    ctl.syncs == 2 and ctl.list[1].dstDeviceEuid == nil
+  )
+  stale:wake()
+  ctl.deliver(2) -- the second add, which Director skips as unchanged, then the synced zserver kept
+  check(
+    "neither a frame nor the synced zserver kept sends a read while zserver syncs the empty list",
+    not ctl.corrupted
+  )
+  ctl.deliver(2)
+  check("the empty list's sync unbinds it", tableOf(ctl) == "")
+  -- Each synced after a list set while stale is taken once no state follows it.
+  fire("ZBindSettle")
+  ctl.deliver()
+  fire("ZBindSettle")
+  ctl.deliver()
+  check(
+    "the read after it finds the table empty, and the list set again is sent",
+    tableOf(ctl) == BOUND and stale:coordinator() == COORD,
+    tableOf(ctl)
+  )
+  fire("ZBindSettle")
+  check(
+    "then spelled out, and synced",
+    ctl.syncs == 4 and ctl.list[1].dstDeviceEuid == COORD and stale.state == "synced"
+  )
+
+  -- A driver update whose Set fails for another reason is stale too; with no coordinator
+  -- known Director then skips the list as the one zserver holds, and no state comes.
+  ctl, ZBind = fresh(SET_BEFORE)
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  ctl.silence()
+  fire("ZV2Read")
+  ZBind2 = reload()
+  local updated = binder(ZBind2)
+  local obj = require("zigbee.zv2"):object()
+  rawset(obj, "Init", function()
+    return 1
   end)
-  zb:drain() -- CONNACK -> onConnack -> beginProbe (probe bind sent)
-  zb:drain() -- EXEC_OK -> beginBindRest -> verifyRead (Mgmt_Bind read sent)
-  CancelTimer("ZBindDrain")
-  return zb, rec
+  apply(updated)
+  rawset(obj, "Init", nil)
+  fire("ZBindApply")
+  check("skipped: nothing shows yet", ctl.syncs == 1 and updated.state == nil)
+  fire("ZBindSettle")
+  check(
+    "with no state after it, the one before stands, and the coordinator is read for",
+    updated.state == "synced" and #ctl.issued == 2
+  )
+  ctl.deliver()
+  fire("ZBindSettle")
+  check("then the list is spelled out, and synced", ctl.syncs == 2 and updated.state == "synced")
+
+  -- Until Director has the device its address does not resolve either.
+  ctl, ZBind = fresh({ zbindList = { eui = EUI, state = "synced" } })
+  zb = binder(ZBind)
+  local address
+  zb.address = function()
+    return address
+  end
+  apply(zb)
+  check(
+    "no address: no list, tried again in a second, as a Set Director refuses is",
+    ctl.calls.SetZdoBindConfig == nil and armedFor.ZBindApply == 1000 and zb.state == nil
+  )
+  zb.retrySince = zb.retrySince - 301
+  fire("ZBindApply")
+  check("every minute once five have passed", armedFor.ZBindApply == 60000 and ctl.calls.SetZdoBindConfig == nil)
+  address = EUI
+  fire("ZBindApply")
+  check("then the list", #ctl.list == 1 and ctl.list[1].srcEndpoint == 2)
+  check("and nothing is left to retry", Timer.ZBindApply == nil and zb.retrySince == nil)
+  ctl.deliver()
+  fire("ZBindSettle")
+  check("set while stale, its synced is taken once none follows it", zb.state == "synced" and tableOf(ctl) == BOUND)
 end
 
 --------------------------------------------------------------------------------
-T.section("binding table shows every target bound -> finish(true)")
+T.section("a disabled list: the table names the bind the lock refused, and the poll covers it")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { TABLE_BOTH, nil, nil },
-    { nil, "timeout", "" },
-  })
-  T.check("flow awaits the binding table after the probe accept", zb.state == "verify", zb.state)
-  T.check("flow has not settled before the table read", rec.count == 0, rec.count)
+  -- NOT_SUPPORTED to the bind: zserver disabled the list with nothing bound.
+  local ctl, ZBind = fresh(SET_BEFORE)
+  ctl.answers[key(2, DOORLOCK)] = 0x84
+  local zb, heard = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  check("disabled, nothing bound", zb.state == "disabled" and tableOf(ctl) == "")
+  check("the table is read", reads(ctl) == "0")
+  ctl.deliver(1)
+  check("the entry the table lacks is refused", keys(zb.refused) == tostring(key(2, DOORLOCK)), keys(zb.refused))
+  check("nothing is left to list, so nothing is set again", ctl.syncs == 1 and Timer.ZBindApply == nil)
+  check("never settled", heard[#heard] == "false")
+  check("kept refused for the next load", #stored("zbindList").refused == 1)
+  ZBind = reload()
+  local again = binder(ZBind)
+  local calls = ctl.calls.SetZdoBindConfig
+  apply(again)
+  check("after a reload no list is set either", ctl.calls.SetZdoBindConfig == calls)
+  apply(again, { { srcEp = 1, cluster = DOORLOCK } })
+  check("but one on another endpoint is", ctl.calls.SetZdoBindConfig == calls + 1)
 
-  -- Clear the cache first, so a passing assertion proves finish(true) re-wrote it.
-  store.zbindCoordEui, store.zbindGwEp = nil, nil
-  zb:drain() -- reads TABLE_BOTH -> verify handler -> finish(true)
+  -- A record whose unbind the lock refused, ahead of DoorLock: nothing is named.
+  ctl, ZBind = fresh({ zbindList = SET_BEFORE.zbindList, zbindCoordEui = COORD }, { rec(0x0001, 1) })
+  ctl.answers[key(2, 0x0001)] = 0x84
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver()
+  check("a record the list lacked, whose unbind was refused: nothing refused", next(zb.refused) == nil)
+  check("and nothing set again", ctl.syncs == 1 and zb.state == "disabled")
 
-  T.check("callback fired exactly once", rec.count == 1, rec.count)
-  T.check("flow settled successfully", rec.ok == true, tostring(rec.ok))
-  T.check("state returns to idle", zb.state == "idle", zb.state)
-  T.check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
-  T.check("gateway endpoint cache saved", store.zbindGwEp == GW_EP, tostring(store.zbindGwEp))
+  -- With no coordinator known, a record could point at a previous one.
+  ctl, ZBind = fresh(SET_BEFORE, { rec(0x0001, 1, "00124B0001CE4B99") })
+  ctl.answers[key(2, 0x0001)] = 0x84
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver()
+  check("records and no coordinator known: nothing refused", next(zb.refused) == nil and ctl.syncs == 1)
+  zb:wake()
+  check("nor read again while none is known", #ctl.issued == 1)
 end
 
 --------------------------------------------------------------------------------
-T.section("table missing a cluster -> re-fire, confirm on re-read")
+T.section("a rejoin: a lock that came back with an empty table gets its list again")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { TABLE_DOORLOCK_ONLY, nil, nil }, -- verify read 1: power bind absent
-    { nil, "timeout", "" },
-    { TABLE_BOTH, nil, nil }, -- verify read 2 (after settle): both present
-    { nil, "timeout", "" },
-  })
-  local before = publishCount(currentFake)
-  zb:drain() -- TABLE_DOORLOCK_ONLY -> re-fire power + arm the settle timer
+  local ctl, ZBind = fresh({ zbindCoordEui = COORD, zbindList = SET_BEFORE.zbindList })
+  local zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver()
+  local syncs = ctl.syncs
+  zb:check()
+  check("the table is read only after a wait", armedFor.ZBindCheck == 10000 and #ctl.issued == 0)
+  fire("ZBindCheck")
+  ctl.deliver()
+  check("one page read; the table still holds the list, so nothing is set", reads(ctl) == "0" and ctl.syncs == syncs)
 
-  T.check("did not settle on the incomplete table", rec.count == 0, rec.count)
-  T.check("re-fired the missing bind", publishCount(currentFake) > before, publishCount(currentFake))
+  ctl.table = {} -- a factory reset under the same device
+  zb:check()
+  fire("ZBindCheck")
+  ctl.deliver(1)
+  check(
+    "an empty table: the same list, the coordinator spelled out, which Director sends",
+    ctl.syncs == syncs + 1 and #ctl.list == 1 and ctl.list[1].dstDeviceEuid == COORD and ctl.list[1].dstEndpoint == nil
+  )
+  ctl.deliver()
+  check("and zserver binds it where it did", tableOf(ctl) == BOUND, tableOf(ctl))
+  fire("ZBindSettle")
+  check("synced", zb.state == "synced")
 
-  ShimFireTimers() -- settle -> verifyRead again (sends a fresh Mgmt_Bind read)
-  zb:drain() -- TABLE_BOTH -> finish(true)
+  -- A second loss names the case zserver lacks.
+  ctl.table = {}
+  zb:check()
+  fire("ZBindCheck")
+  ctl.deliver()
+  fire("ZBindSettle")
+  check(
+    "a second loss spells it in lower case, and is bound again",
+    ctl.syncs == syncs + 2 and ctl.list[1].dstDeviceEuid == COORD:lower() and tableOf(ctl) == BOUND,
+    tableOf(ctl)
+  )
 
-  T.check("callback fired exactly once", rec.count == 1, rec.count)
-  T.check("flow settled successfully once verified", rec.ok == true, tostring(rec.ok))
-  T.check("state returns to idle", zb.state == "idle", zb.state)
-  T.check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
+  zb:check()
+  ctl.cb().config({ state = "pending" }) -- zserver's own sync, from a reboot it noticed
+  check("a pending state within the wait cancels the check", Timer.ZBindCheck == nil)
+  zb:check()
+  check("and while it is not synced there is none", Timer.ZBindCheck == nil)
+  ctl.cb().config({ state = "synced" })
+
+  -- The rejoin's read names a coordinator the read after synced missed.
+  ctl, ZBind = fresh()
+  local heard
+  zb, heard = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  ctl.silence()
+  fire("ZV2Read")
+  check("the read after synced got no page", zb:coordinator() == nil)
+  zb:check()
+  fire("ZBindCheck")
+  ctl.deliver()
+  check("a rejoin's read names the coordinator", zb:coordinator() == COORD and stored("zbindCoordEui") == COORD)
+  check("and the hook hears it settled", heard[#heard] == "true")
+
+  -- An empty table while no coordinator is known cannot be spelled another way.
+  ctl, ZBind = fresh()
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  ctl.silence()
+  fire("ZV2Read")
+  ctl.table = {}
+  zb:check()
+  fire("ZBindCheck")
+  ctl.deliver()
+  check("no coordinator known: a lost table is not set again", ctl.syncs == 1 and stored("zbindList").form == nil)
 end
 
 --------------------------------------------------------------------------------
-T.section("a cluster never appears -> bounded retries, still finish(true)")
+T.section("the coordinator: kept with its controller, else read once")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { TABLE_DOORLOCK_ONLY, nil, nil }, -- read 1
-    { nil, "timeout", "" },
-    { TABLE_DOORLOCK_ONLY, nil, nil }, -- read 2
-    { nil, "timeout", "" },
-    { TABLE_DOORLOCK_ONLY, nil, nil }, -- read 3 (retry cap)
-    { nil, "timeout", "" },
-    { TABLE_DOORLOCK_ONLY, nil, nil }, -- would be read 4 if it looped
-    { nil, "timeout", "" },
-  })
-  zb:drain() -- read 1 -> missing, re-fire, settle
-  T.check("does not settle on read 1", rec.count == 0, rec.count)
-  ShimFireTimers()
-  zb:drain() -- read 2 -> missing, re-fire, settle
-  T.check("does not settle on read 2", rec.count == 0, rec.count)
-  ShimFireTimers()
-  zb:drain() -- read 3 -> retry cap reached -> finish(true)
+  -- One learned on another controller is not this device's.
+  local ctl, ZBind = fresh({ zbindCoordEui = "00124B0001CE4B99", zbindCoordZserver = 35 })
+  local zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver()
+  check("the one learned on another controller is dropped, and the table read", reads(ctl) == "0")
+  check("which names this one", zb:coordinator() == COORD and stored("zbindCoordZserver") == 20)
 
-  T.check("settles after the bounded retries", rec.count == 1, rec.count)
-  T.check("settles successfully (accepted binds kept)", rec.ok == true, tostring(rec.ok))
-  T.check("state returns to idle", zb.state == "idle", zb.state)
-  T.check("coordinator cache saved", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
+  -- One stored while no controller was known is kept.
+  ctl, ZBind = fresh({ zbindCoordEui = COORD })
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver()
+  check("one stored without its controller is taken, and nothing read", zb:coordinator() == COORD and reads(ctl) == "")
+
+  -- A bind an installer made since zserver's sync is not one of the list's.
+  ctl, ZBind = fresh()
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  ctl.table[#ctl.table + 1] = rec(0x0006, 1, "4CE175B4C3970000")
+  ctl.deliver()
+  check("an unlisted record names nothing", zb:coordinator() == COORD)
+
+  -- A table whose listed records name two nodes names no coordinator.
+  ctl, ZBind = fresh()
+  zb = binder(ZBind)
+  apply(zb, { TARGETS[1], { srcEp = 2, cluster = 0x0001 } })
+  ctl.deliver(2)
+  ctl.table[2].dstDeviceEuid = "00124B0001CE4B99" -- as zserver would never leave it; played to disprove
+  ctl.deliver()
+  check("two nodes: none is taken", zb:coordinator() == nil and stored("zbindCoordEui") == nil)
 end
 
 --------------------------------------------------------------------------------
-T.section("completing table arrives in the same read as the close")
+T.section("nothing is read while zserver syncs")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { TABLE_BOTH, "closed", nil }, -- the confirming table, plus the close
-    { nil, "timeout", "" },
-  })
-  store.zbindCoordEui, store.zbindGwEp = nil, nil
-  zb:drain() -- close branch parses the table before settling -> finish(true)
+  local ctl, ZBind = fresh()
+  local zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  check("a read is out after synced", reads(ctl) == "0")
+  ctl.cb().config({ state = "pending" }) -- Director's own list, before the page came
+  ctl.deliver()
+  check(
+    "the pending state dropped the read: its page names no coordinator",
+    stored("zbindCoordEui") == nil and zb.walking == nil
+  )
+  check("and reads no further", reads(ctl) == "0", reads(ctl))
 
-  T.check("callback fired exactly once", rec.count == 1, rec.count)
-  T.check("flow settled successfully", rec.ok == true, tostring(rec.ok))
-  T.check("state returns to idle", zb.state == "idle", zb.state)
-  T.check("coordinator cache survives", store.zbindCoordEui == COORD, tostring(store.zbindCoordEui))
-  T.check("gateway endpoint cache survives", store.zbindGwEp == GW_EP, tostring(store.zbindGwEp))
-  T.check("socket was closed on settle", currentFake.closed == true)
+  -- A disabled list whose read never came: nothing is judged until the lock speaks.
+  ctl, ZBind = fresh({ zbindCoordEui = COORD })
+  ctl.answers[key(2, DOORLOCK)] = 0x84
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  ctl.silence()
+  fire("ZV2Read")
+  check("no page: nothing refused, nothing set", next(zb.refused) == nil and ctl.syncs == 1)
 end
 
 --------------------------------------------------------------------------------
-T.section("close carries a truncated table (no completion possible)")
+T.section("a read that got no page is asked again when the lock next speaks")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { TRUNCATED, "closed", nil },
-    { nil, "timeout", "" },
-  })
-  zb:drain()
+  -- A sleepy lock dozed before the read after disabled reached it.
+  local ctl, ZBind = fresh({ zbindCoordEui = COORD, zbindList = SET_BEFORE.zbindList })
+  ctl.answers[key(2, DOORLOCK)] = 0x84
+  local zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  ctl.silence()
+  fire("ZV2Read")
+  check("no page: nothing refused yet", next(zb.refused) == nil and zb.walking == nil)
+  ZBind = reload()
+  local again = binder(ZBind)
+  apply(again)
+  check("a reload hears no state for its list, and reads nothing", again.state == "disabled" and #ctl.issued == 1)
+  again:wake()
+  ctl.deliver()
+  check("its next frame reads the table", #ctl.issued == 2 and again.refused[key(2, DOORLOCK)])
 
-  T.check("callback fired exactly once", rec.count == 1, rec.count)
-  T.check("flow settled as a failure", rec.ok == false, tostring(rec.ok))
-  T.check("state returns to idle", zb.state == "idle", zb.state)
-  T.check("coordinator cache dropped", store.zbindCoordEui == nil, tostring(store.zbindCoordEui))
-  T.check("gateway endpoint cache dropped", store.zbindGwEp == nil, tostring(store.zbindGwEp))
+  -- The read for the coordinator after synced, likewise.
+  ctl, ZBind = fresh()
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  ctl.silence()
+  fire("ZV2Read")
+  zb:wake()
+  check("no page: the next frame reads the table again", #ctl.issued == 2)
+  ctl.silence()
+  fire("ZV2Read")
+  zb:wake()
+  check("frames ask at most every quarter hour", #ctl.issued == 2 and zb:coordinator() == nil)
+  zb.askedAt = zb.askedAt - 900
+  zb:wake()
+  ctl.deliver()
+  check("then again, and the table names the coordinator", #ctl.issued == 3 and zb:coordinator() == COORD)
+  zb.askedAt = zb.askedAt - 900
+  zb:wake()
+  check("which is not read again", #ctl.issued == 3)
 end
 
 --------------------------------------------------------------------------------
-T.section("close carries no bytes: drain does not settle, step timeout rescues")
+T.section("a list zserver leaves pending is set again two hours after a frame")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { nil, "closed", "" }, -- empty-chunk break fires before the closed check
-    { nil, "timeout", "" },
-  })
-  zb:drain()
+  -- zserver's table read ended NO_APS_ACK and was never retried, so the list stayed
+  -- pending through the device's later wakes.
+  local ctl, ZBind = fresh({ zbindCoordEui = COORD, zbindList = SET_BEFORE.zbindList })
+  local zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(1)
+  ctl.silence()
+  zb:wake()
+  zb.pendingHeard = zb.pendingHeard - 7199
+  zb:wake()
+  check("pending under two hours after a frame: nothing is set", ctl.syncs == 1)
+  zb.pendingHeard = zb.pendingHeard - 1
+  zb:wake()
+  check("then the same list, the coordinator spelled out", ctl.syncs == 2 and ctl.list[1].dstDeviceEuid == COORD)
+  ctl.deliver(1) -- pending again, and its sync stalls too
+  ctl.silence()
+  zb:wake()
+  zb.pendingHeard = zb.pendingHeard - 7199
+  zb:wake()
+  check("the next waits two hours from the frame after it", ctl.syncs == 2)
+  zb.pendingHeard = zb.pendingHeard - 1
+  zb:wake()
+  ctl.deliver()
+  fire("ZBindSettle")
+  check(
+    "spelled the other way, and zserver syncs it",
+    ctl.syncs == 3 and zb.state == "synced" and tableOf(ctl) == BOUND,
+    tableOf(ctl)
+  )
 
-  T.check("byte-less close does not settle in drain", rec.count == 0, rec.count)
-  T.check("flow is still mid-verify after the empty close", zb.state == "verify", zb.state)
-  T.check("socket left open for the step timer", currentFake.closed ~= true)
-
-  ShimFireTimers() -- the step timeout is the only thing that settles this case
-
-  T.check("step timeout settles the flow", rec.count == 1, rec.count)
-  T.check("timed-out flow settles as a failure", rec.ok == false, tostring(rec.ok))
-  T.check("state returns to idle", zb.state == "idle", zb.state)
-  T.check("coordinator cache dropped", store.zbindCoordEui == nil, tostring(store.zbindCoordEui))
+  -- A sync that ends starts no clock for the next list.
+  ctl, ZBind = fresh({ zbindCoordEui = COORD, zbindList = SET_BEFORE.zbindList })
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(1)
+  zb:wake()
+  zb.pendingHeard = zb.pendingHeard - 7200
+  ctl.deliver()
+  apply(zb, { { srcEp = 1, cluster = DOORLOCK } })
+  ctl.deliver(1)
+  zb:wake()
+  check("a later list's first frame while pending sets nothing", ctl.syncs == 2)
 end
 
 --------------------------------------------------------------------------------
-T.section("a same-cluster bind on a different endpoint is not our target")
+T.section("no list is set while the driver's own read is out")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { TABLE_WRONG_EP, nil, nil }, -- clusters bound, but on srcEp 99 not the target's 1
-    { nil, "timeout", "" },
-    { TABLE_BOTH, nil, nil }, -- the correct-endpoint table on the re-read
-    { nil, "timeout", "" },
-  })
-  local before = publishCount(currentFake)
-  zb:drain() -- wrong-endpoint records must not satisfy the (srcEp, cluster) targets
+  -- zserver's read takes any page it hears: a Set now would start one.
+  local moved = { { srcEp = 1, cluster = DOORLOCK } }
+  local ctl, ZBind = fresh()
+  local zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  check("synced, and the read for the coordinator is out", zb.walking ~= nil and reads(ctl) == "0")
+  apply(zb, moved)
+  check("a changed list waits for it", ctl.syncs == 1)
+  ctl.deliver(1)
+  check("and goes once its page is in", ctl.syncs == 2 and ctl.list[1].srcEndpoint == 1 and zb:coordinator() == COORD)
+  ctl.deliver()
+  check("then syncs", zb.state == "synced" and tableOf(ctl) == "0101/1>2", tableOf(ctl))
 
-  T.check("does not settle on a wrong-endpoint match", rec.count == 0, rec.count)
-  T.check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
-
-  ShimFireTimers()
-  zb:drain() -- the exact triple is now present
-
-  T.check("settles once the exact triple is present", rec.ok == true, tostring(rec.ok))
-  T.check("state returns to idle", zb.state == "idle", zb.state)
+  -- Director's own list meanwhile: the page is zserver's to take, and the read is over.
+  ctl, ZBind = fresh()
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver(2)
+  ctl.cb().config({ state = "pending" })
+  apply(zb, moved)
+  check("a pending state leaves the list waiting on the read", ctl.syncs == 1 and zb.walking ~= nil)
+  ctl.deliver(1)
+  check("whose page ends it, naming nothing, and the list goes", ctl.syncs == 2 and zb:coordinator() == nil)
 end
 
 --------------------------------------------------------------------------------
-T.section("a bind at a different gateway endpoint is not our target")
+T.section("what the list cannot hold is never sent, and the list is never empty")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { TABLE_WRONG_DSTEP, nil, nil }, -- bound to coord, but at gwEp+1 not the probed gwEp
-    { nil, "timeout", "" },
-    { TABLE_BOTH, nil, nil }, -- the correct gateway endpoint on the re-read
-    { nil, "timeout", "" },
-  })
-  local before = publishCount(currentFake)
-  zb:drain() -- a record naming a different gateway endpoint must not confirm our bind
-
-  T.check("does not settle on a wrong-gateway-endpoint match", rec.count == 0, rec.count)
-  T.check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
-
-  ShimFireTimers()
-  zb:drain() -- the exact triple is now present
-
-  T.check("settles once the exact triple is present", rec.ok == true, tostring(rec.ok))
-  T.check("state returns to idle", zb.state == "idle", zb.state)
+  local ctl, ZBind = fresh()
+  local zb = binder(ZBind)
+  apply(zb, { { srcEp = 2, cluster = 0x0000 }, TARGETS[1] })
+  check("Basic cannot be listed: only DoorLock goes", #ctl.list == 1 and ctl.list[1].clusterId == DOORLOCK)
+  ctl, ZBind = fresh()
+  zb = binder(ZBind)
+  apply(zb, { { srcEp = 242, cluster = DOORLOCK } })
+  check("nor Green Power's endpoint 242: no list at all", ctl.calls.SetZdoBindConfig == nil and Timer.ZBindApply == nil)
+  apply(zb, { { srcEp = 2, cluster = 0x0000 } })
+  check("nor for Basic alone", ctl.calls.SetZdoBindConfig == nil)
+  apply(zb, {})
+  check("nor for no targets", ctl.calls.SetZdoBindConfig == nil)
 end
 
 --------------------------------------------------------------------------------
-T.section("records that omit the endpoint field still confirm the target")
+T.section("a closed binder hears nothing and keeps no timer")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { TABLE_NO_DSTEP, nil, nil }, -- records carry no field 6; tolerated
-    { nil, "timeout", "" },
-  })
-  local before = publishCount(currentFake)
-  zb:drain() -- (srcEp, cluster, coordinator) present, endpoint field absent -> confirmed
+  local ctl, ZBind = fresh()
+  local zb, heard = binder(ZBind)
+  apply(zb)
+  zb:close()
+  ctl.deliver()
+  check("a closed binder hears no state", #heard == 0 and zb.state == nil)
+  ctl.known = false
+  apply(zb, { { srcEp = 1, cluster = DOORLOCK } })
+  check("a Set that fails is tried again", Timer.ZBindApply ~= nil)
+  zb:close()
+  check("until it is closed", Timer.ZBindApply == nil and zb.retrySince == nil)
 
-  T.check("settles on (srcEp, cluster, coordinator) alone", rec.ok == true, tostring(rec.ok))
-  T.check("does not re-fire the already-present binds", publishCount(currentFake) == before, publishCount(currentFake))
-  T.check("callback fired exactly once", rec.count == 1, rec.count)
-  T.check("state returns to idle", zb.state == "idle", zb.state)
+  -- The same lock back: zserver went pending on Director's copy of the list while no
+  -- binder listened, and the lock sleeps.
+  ctl, ZBind = fresh({ zbindCoordEui = COORD })
+  zb = binder(ZBind)
+  apply(zb)
+  ctl.deliver()
+  zb:close()
+  ctl.published, ctl.asleep = {}, true
+  ctl.online()
+  ctl.deliver()
+  local next = binder(ZBind)
+  apply(next)
+  check("the next binder takes that pending over its record's synced", next.state == "pending")
+  ctl.asleep = false
+  ctl.deliver()
+  check("and the synced at its wake", next.state == "synced")
 end
 
 --------------------------------------------------------------------------------
-T.section("a bind to a different destination node is not our target")
+T.section("no path above read the table while zserver synced")
 --------------------------------------------------------------------------------
 do
-  local zb, rec = runToVerify({
-    { CONNACK, nil, nil },
-    { nil, "timeout", "" },
-    { EXEC_OK_PUBLISH, nil, nil },
-    { nil, "timeout", "" },
-    { TABLE_WRONG_DST, nil, nil }, -- right (srcEp, cluster), wrong destination node
-    { nil, "timeout", "" },
-    { TABLE_BOTH, nil, nil }, -- the coordinator destination on the re-read
-    { nil, "timeout", "" },
-  })
-  local before = publishCount(currentFake)
-  zb:drain() -- a record naming another destination must not confirm our bind
-
-  T.check("does not settle on a non-coordinator destination", rec.count == 0, rec.count)
-  T.check("re-fires the target binds", publishCount(currentFake) > before, publishCount(currentFake))
-
-  ShimFireTimers()
-  zb:drain() -- the coordinator destination is now present
-
-  T.check("settles once the coordinator bind is present", rec.ok == true, tostring(rec.ok))
-  T.check("state returns to idle", zb.state == "idle", zb.state)
+  -- zv2's pcall turns the shim's raise into a read that did not go, so the shim notes it.
+  local n = 0
+  for _, ctl in ipairs(controllers) do
+    n = n + (ctl.corrupted and 1 or 0)
+  end
+  check("no controller saw one", n == 0, n)
 end
 
 T.finish()
