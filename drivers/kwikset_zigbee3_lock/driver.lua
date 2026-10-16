@@ -114,9 +114,6 @@ local USER_CODE_CAPABILITIES = {
   "has_admin_code",
 }
 
--- Seconds between the Unix epoch (1970) and the ZCL epoch (2000-01-01 UTC).
-local ZCL_EPOCH_OFFSET = 946684800
-
 -- DoorLock attributes
 local ATTR_LOCK_STATE = 0x0000 -- 0 not-fully / 1 locked / 2 unlocked
 local ATTR_NUM_LOG_RECORDS = 0x0010 -- NumberOfLogRecordsSupported (0 = no event log)
@@ -1174,6 +1171,24 @@ end
 -- weekday DaysMask has bit0=Sunday .. bit6=Saturday.
 local WEEKDAY_BITS = { 1, 2, 4, 8, 16, 32, 64 }
 
+--- ZCL LocalTime for a date and a minute of that day: seconds since 2000-01-01
+--- 00:00 on the lock's clock, which keeps local wall-clock time (DST included),
+--- so it is counted on the calendar alone, with no time zone.
+--- @param year integer
+--- @param month integer
+--- @param day integer
+--- @param minutes integer Minutes from midnight.
+--- @return integer
+local function zclLocalTime(year, month, day, minutes)
+  -- Days from 1970-01-01 (Hinnant's days_from_civil), less the 10957 to 2000-01-01.
+  local y = month <= 2 and year - 1 or year
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local doy = math.floor((153 * ((month + 9) % 12) + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return (era * 146097 + doe - 719468 - 10957) * 86400 + minutes * 60
+end
+
 --- Push a user's schedule to the lock (ZCL DoorLock) at the user's slot. A
 --- restricted user gets a weekday or yearday schedule; an unrestricted user has
 --- both cleared. The lock derives the user type from the schedule itself and
@@ -1191,22 +1206,8 @@ local function writeUserSchedule(id, u)
     return
   end
   if s.type == "date_range" then
-    local startT = os.time({
-      year = s.startYear or 2000,
-      month = s.startMonth or 1,
-      day = s.startDay or 1,
-      hour = math.floor((s.startTime or 0) / 60),
-      min = (s.startTime or 0) % 60,
-      sec = 0,
-    }) - ZCL_EPOCH_OFFSET
-    local endT = os.time({
-      year = s.endYear or 2000,
-      month = s.endMonth or 1,
-      day = s.endDay or 1,
-      hour = math.floor((s.endTime or 0) / 60),
-      min = (s.endTime or 0) % 60,
-      sec = 0,
-    }) - ZCL_EPOCH_OFFSET
+    local startT = zclLocalTime(s.startYear or 2000, s.startMonth or 1, s.startDay or 1, s.startTime or 0)
+    local endT = zclLocalTime(s.endYear or 2000, s.endMonth or 1, s.endDay or 1, s.endTime or 0)
     markPendingSent(
       "sched:" .. id,
       sendCommand(
