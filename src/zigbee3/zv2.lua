@@ -1,9 +1,10 @@
 --- The controller's own Zigbee 3 driver API, C4:ZigbeeV2(), from OS 4.3.
 ---
---- The object acts on the calling driver's own device: here, the bind list zserver
---- keeps for it (SetZdoBindConfig) and a read of its binding table, both for
---- zbind.lua. None of it is documented; every shape here was measured on a 4.3.0
---- controller.
+--- The object acts on the calling driver's own device: the bind list zserver keeps
+--- for it (SetZdoBindConfig) and a read of its binding table for zbind.lua, the
+--- coordinator's interview of the device for deviceinfo.lua, and the device's online
+--- status for device.lua. None of it is documented; every shape here was measured on
+--- a 4.3.0 controller.
 ---
 --- One object serves the driver, held for its life: collecting any ZigbeeV2 object
 --- unregisters the device's callbacks, whichever object registered them. It is
@@ -24,14 +25,14 @@ local TIMER_READ = "ZV2Read"
 --- @class ZV2
 --- @field zb userdata|nil The driver's ZigbeeV2 object: nil until first asked, and a miss is tried again by the next call.
 --- @field read { cid: integer, at: integer, taken: boolean?, page: Deferred }|nil The one table read out.
---- @field listener fun(state: string)|nil Who hears the bind list's state: zbind.lua's binder.
---- @field unheard string|nil The last state no binder heard, handed to the next one.
+--- @field listener fun(state: string)|nil Who hears the bind list's state: zbind.lua's binder for the device.
+--- @field unheard string|nil The last state no binder heard: a re-pair's binder is made only after the interview, and the pending of Director's list can come before it.
 --- @field ready userdata|nil The object once Init() and the callbacks took; a failed Init() (the Zigbee manager not up yet) is tried again by the next call.
 local ZV2 = {}
 ZV2.__index = ZV2
 
--- zserver took a sleepy device's command up to 840 s after it was sent, then ended it
--- within 60 s: these bounds only end a read whose status was lost.
+-- zserver took a sleepy device's command up to 840 s after it was sent (622), then
+-- ended it within 60 s: these bounds only end a read whose status was lost.
 ZV2.CMD_TAKE_MS = 15 * ONE_MINUTE
 -- Every page that followed its read's ok came within a second of it.
 ZV2.CMD_WAIT_MS = 15 * ONE_SECOND
@@ -57,6 +58,24 @@ function ZV2:object()
     self.zb = (ok and obj) or nil
   end
   return self.zb
+end
+
+--- The device's status as the Zigbee server holds it, "ONLINE" or "OFFLINE"; false for a device
+--- the Zigbee manager does not have, as before Director adds it; nil where none can be read.
+--- @return string|false|nil status
+function ZV2:status()
+  local obj = self:object()
+  local ok, st = pcall(function()
+    return obj and obj:GetSysDeviceStatus()
+  end)
+  local status = ok and type(st) == "table" and st.status
+  if status == "ONLINE" or status == "OFFLINE" then
+    return status
+  end
+  if obj and ok and st == nil then
+    return false
+  end
+  return nil
 end
 
 --- A 16-digit upper-case hex EUI64 from the API's hex string, or nil.
@@ -125,7 +144,7 @@ end
 --- @param t table
 function ZV2:_onTable(t)
   -- zserver's own sync pages reach this callback too: only the page for the read out,
-  -- once zserver has taken it, is the read's (one came between its in progress and ok).
+  -- once zserver has taken it, is the read's (617's came between its in progress and ok).
   local at = type(t) == "table" and tonumber(t.startIndex)
   if not (self.read and self.read.taken and at == self.read.at) then
     return

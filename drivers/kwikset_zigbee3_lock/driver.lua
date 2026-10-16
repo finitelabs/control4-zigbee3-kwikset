@@ -27,7 +27,7 @@ JSON = require("JSON")
 
 local log = require("lib.logging")
 local persist = require("lib.persist")
-local ZBind = require("zigbee.zbind")
+local ZBind = require("zigbee3.zbind")
 --#ifndef DRIVERCENTRAL
 local githubUpdater = require("lib.github-updater")
 --#endif
@@ -2296,7 +2296,8 @@ function OnDriverLateInit(driverInitType)
   -- restricted set, which is correct.
   applyUserCodeCapabilities()
   applySettingCapabilities()
-  -- A persisted endpoint gives zserver the event bind now; Director skips it unchanged.
+  -- A persisted endpoint gives zserver the event bind now, or after one table read
+  -- when it is the lock's first list; Director skips an unchanged one.
   makeBinder(driverInitType)
   establishEventBinds()
   -- Writes owed from before the reload: re-arm the retry window but don't blast

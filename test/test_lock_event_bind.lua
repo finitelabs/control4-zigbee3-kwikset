@@ -1,8 +1,10 @@
 -- The lock driver's bind list, with the driver loaded as Director loads it. The store
 -- holds the lock's endpoint (dstEndpoint) and the coordinator's EUI64 (zbindCoordEui),
--- the endpoint alone, or neither. A driver update must set zserver's list at once,
--- take a stored coordinator as its own, keep the lock's binds to the coordinator
--- (DoorLock, and the Poll Control it joined with), and go on handling the lock.
+-- those and the list's record a load kept (zbindList), the endpoint alone, or neither.
+-- A driver update must take a stored coordinator as its own, read the lock's table
+-- once before its first list and not over a list already set, keep the lock's binds
+-- to the coordinator (DoorLock, and the Poll Control it joined with), and go on
+-- handling the lock.
 --
 -- Run from the driver root:
 --   make test
@@ -33,6 +35,15 @@ local DOORLOCK = 0x0101
 local POLL_CONTROL = 0x0020
 -- The store: the lock's endpoint and keypad verdict, and the coordinator it is bound to.
 local STORED = { dstEndpoint = 2, supportsUserCodes = true, keypadKnown = true, zbindCoordEui = COORD }
+-- Those, the coordinator's controller, and the record a load kept once it set the list.
+local LISTED = {
+  dstEndpoint = 2,
+  supportsUserCodes = true,
+  keypadKnown = true,
+  zbindCoordEui = COORD,
+  zbindCoordZserver = 20,
+  zbindList = { eui = EUI, refused = {}, state = "synced" },
+}
 -- The endpoint and keypad verdict alone, no coordinator.
 local NO_COORD = { dstEndpoint = 2, supportsUserCodes = true, keypadKnown = true }
 
@@ -103,6 +114,21 @@ local JOINED = "0020/2>1,0101/2>2"
 -- What zserver binds, in list order, on a lock that holds neither.
 local BOUND = "0101/2>2,0020/2>1"
 
+-- Each earlier load's zv2, kept: collecting its ZigbeeV2 object would unregister the
+-- callbacks of the next, where a controller gives each load a Lua state of its own.
+local loads = {}
+--- Run the driver's source and init as Director does after `initType`.
+local function load(initType)
+  loads[#loads + 1] = package.loaded["zigbee3.zv2"]
+  T.unload("^zigbee3%.")
+  ShimResetZigbeePackets()
+  proxied = {}
+  dofile(DRIVER)
+  OnDriverInit()
+  OnDriverLateInit(initType)
+  CancelTimer("UpdateCheck")
+end
+
 local seeded = {}
 --- Load the driver as Director does after `initType`, over a store holding `seed` and a
 --- lock whose binding table holds `records`; `before(ctl)` readies the controller first.
@@ -129,14 +155,17 @@ local function start(seed, records, initType, before)
   if before then
     before(ctl)
   end
-  T.unload("^zigbee%.")
-  ShimResetZigbeePackets()
-  proxied = {}
-  dofile(DRIVER)
-  OnDriverInit()
-  OnDriverLateInit(initType)
-  CancelTimer("UpdateCheck")
+  load(initType)
   return ctl
+end
+
+--- Load the driver again as Director does after `initType`, over what the last load
+--- stored and the same controller and lock.
+local function reload(initType)
+  KillAllTimers()
+  ShimPersistLand()
+  persist._persist = {}
+  load(initType)
 end
 
 --- Fire one named timer now, as its expiry would.
@@ -165,13 +194,16 @@ local KEYPAD_LOCK = string.char(0x09, 0x10, 0x20, 0x00, 0x01, 0x03, 0x00, 0x00, 
 local LOCK_STATE_LOCKED = string.char(0x18, 0x01, 0x01, 0x00, 0x00, 0x00, 0x30, 0x01)
 
 --------------------------------------------------------------------------------
-T.section("a driver update over a stored coordinator: the list goes at once, and keeps both binds")
+T.section("a driver update over a stored coordinator: the table is read, then the list keeps both binds")
 --------------------------------------------------------------------------------
 do
   local ctl = start(STORED, joined(), "DIT_UPDATING")
+  -- The first list unbinds what it leaves out, so what the lock holds is read before it.
+  check("late init reads the lock's table, and sets no list yet", #ctl.issued == 1 and ctl.syncs == 0)
+  ctl.deliver(1)
   -- Naming no coordinator: Director keeps the list across an update.
   check(
-    "late init set DoorLock, then Poll Control to the coordinator's ep1, from the stored endpoint",
+    "then sets DoorLock, then Poll Control to the coordinator's ep1, from the stored endpoint",
     ctl.syncs == 1 and listOf(ctl) == "0101/2>-,0020/2>1",
     listOf(ctl)
   )
@@ -181,7 +213,7 @@ do
     tableOf(ctl) == JOINED and ctl.state == "synced",
     tableOf(ctl)
   )
-  check("nothing was read: the stored coordinator is taken", #ctl.issued == 0)
+  check("nothing else was read: the stored coordinator is taken", #ctl.issued == 1)
   check("which stays as it was", stored("zbindCoordEui") == COORD)
   local list = stored("zbindList")
   check("the list's record is kept for this lock", type(list) == "table" and list.eui == EUI and list.state == "synced")
@@ -213,7 +245,7 @@ do
     tableOf(ctl) == BOUND and ctl.state == "synced",
     tableOf(ctl)
   )
-  check("and nothing is read", #ctl.issued == 0)
+  check("and the table is read only before the list", #ctl.issued == 1)
 end
 
 --------------------------------------------------------------------------------
@@ -228,14 +260,30 @@ do
 end
 
 --------------------------------------------------------------------------------
-T.section("a controller reboot over a stored coordinator names it")
+T.section("a driver update over a list a load set costs nothing")
+--------------------------------------------------------------------------------
+do
+  -- The first load gives Director and zserver the list; the second is the update.
+  local ctl = start(LISTED, joined(), "DIT_UPDATING")
+  check("the record is this lock's: its list goes unread", ctl.syncs == 1 and #ctl.issued == 0, listOf(ctl))
+  ctl.deliver()
+  local calls = ctl.calls.SetZdoBindConfig
+  reload("DIT_UPDATING")
+  check("the list is set again, and Director skips it", ctl.calls.SetZdoBindConfig == calls + 1 and ctl.syncs == 1)
+  check("so nothing is read, and the binds stay", #ctl.issued == 0 and #ctl.queue == 0 and tableOf(ctl) == JOINED)
+  local list = stored("zbindList")
+  check("and the record still says synced", type(list) == "table" and list.eui == EUI and list.state == "synced")
+end
+
+--------------------------------------------------------------------------------
+T.section("a controller reboot over the list's record names the stored coordinator")
 --------------------------------------------------------------------------------
 do
   -- Director then holds no list for the lock, so one naming the coordinator is sent.
-  local ctl = start(STORED, joined(), "DIT_STARTUP")
+  local ctl = start(LISTED, joined(), "DIT_STARTUP")
   check(
-    "the list names the stored coordinator",
-    ctl.syncs == 1 and listOf(ctl) == "0101/2>-@" .. COORD .. ",0020/2>1@" .. COORD,
+    "the list names the stored coordinator, with no read first",
+    ctl.syncs == 1 and listOf(ctl) == "0101/2>-@" .. COORD .. ",0020/2>1@" .. COORD and #ctl.issued == 0,
     listOf(ctl)
   )
   ctl.deliver()
@@ -271,7 +319,7 @@ do
   local ctl = start(STORED, {}, "DIT_UPDATING", function(c)
     c.answers[2 * 65536 + POLL_CONTROL] = 0x84 -- NOT_SUPPORTED, which disables the list
   end)
-  ctl.deliver(2) -- pending, then zserver's sync
+  ctl.deliver(3) -- the table read, pending, then zserver's sync
   check(
     "the sync bound DoorLock before the refusal disabled the list",
     tableOf(ctl) == "0101/2>2" and ctl.state == "disabled",
@@ -307,7 +355,7 @@ end
 T.section("ONLINE after a Set refused before Director added the lock sets the list at once")
 --------------------------------------------------------------------------------
 do
-  local ctl = start(STORED, joined(), "DIT_STARTUP", function(c)
+  local ctl = start(LISTED, joined(), "DIT_STARTUP", function(c)
     c.known = false
   end)
   check(
@@ -319,6 +367,30 @@ do
   OnZigbeeOnlineStatusChanged("ONLINE", "", "")
   check("ONLINE sets it without waiting for the retry", ctl.syncs == 1 and Timer.ZBindApply == nil)
   ctl.deliver()
+  check("and zserver keeps both binds", tableOf(ctl) == JOINED and ctl.state == "synced", tableOf(ctl))
+end
+
+--------------------------------------------------------------------------------
+T.section("a reboot over a stored coordinator before Director has the lock: the list goes once it speaks")
+--------------------------------------------------------------------------------
+do
+  local ctl = start(STORED, joined(), "DIT_STARTUP", function(c)
+    c.known = false
+  end)
+  check(
+    "the read before the first list is refused as not found: nothing set",
+    ctl.syncs == 0 and #ctl.invalid == 1 and ctl.invalid[1].kind == "read"
+  )
+  ctl.known = true
+  ctl.online()
+  OnZigbeeOnlineStatusChanged("ONLINE", "", "")
+  OnZigbeePacketIn(LOCK_STATE_LOCKED, 0x0104, DOORLOCK, 0, 2, 1)
+  ctl.deliver()
+  check(
+    "by the lock's next frame the table is read, and the list names the coordinator",
+    #ctl.issued == 1 and listOf(ctl) == "0101/2>-@" .. COORD .. ",0020/2>1@" .. COORD,
+    listOf(ctl)
+  )
   check("and zserver keeps both binds", tableOf(ctl) == JOINED and ctl.state == "synced", tableOf(ctl))
 end
 

@@ -5,7 +5,9 @@
 -- Three things. C4:SendZigbeePacket, which only a Zigbee driver calls, recorded so
 -- a suite can see what went out. The C4:Persist* store as a controller answers it: a
 -- write is read back only once it lands, which a suite marks at the seams between
--- calls with ShimPersistLand. And C4:ZigbeeV2(), opt-in through ShimInstallZigbeeV2.
+-- calls with ShimPersistLand. And C4:ZigbeeV2(), opt-in through ShimInstallZigbeeV2:
+-- control4-zigbee3's c4_local.lua section unchanged, so its test_zv2.lua and
+-- test_zbind.lua, copied with src/zigbee3/, run here as they are.
 
 require("c4_shim")
 
@@ -64,11 +66,11 @@ function ShimResetZigbeePackets()
   zigbee_packets = {}
 end
 
--- C4:ZigbeeV2(), the part the bind list uses, as measured on OS 4.3.0 (plugs, sleepy
--- sensors, and a driver whose device the Zigbee server does not know, 2026-09-24).
--- Anything the shim does not model raises rather than answers, so no test can lean
--- on invented behaviour. zserver, Director and the device are played by the
--- controller that ShimInstallZigbeeV2 returns.
+-- C4:ZigbeeV2(), as measured on OS 4.3.0 (plugs, sleepy sensors, and a driver whose
+-- device the Zigbee server does not know, 2026-09-24). Anything the shim does not
+-- model raises rather than answers, so no test can lean on invented behaviour.
+-- zserver, Director and the device are played by the controller that
+-- ShimInstallZigbeeV2 returns.
 
 -- The coordinator's clusters per endpoint, as decoded on the dev controller.
 local V2_ENDPOINT_RANGES = {
@@ -91,7 +93,7 @@ local V2_ENDPOINT_RANGES = {
 }
 
 --- The coordinator endpoint zserver binds a list entry to when the entry names none:
---- the lowest after ep1 that models the cluster, else ep1.
+--- the lowest after ep1 that models the cluster, else ep1 (0xFCC0 and 0xFF03 went to 1).
 local function v2Endpoint(cluster)
   local best
   for ep, ranges in pairs(V2_ENDPOINT_RANGES) do
@@ -130,16 +132,20 @@ end
 
 --- Install C4:ZigbeeV2() and return its controller.
 --- opts.coord: the coordinator's EUI64, which zserver fills into a list entry.
+--- opts.info / opts.discovery: what GetSysDeviceInfo and GetSysDeviceDiscovery
+--- return for a device the Zigbee server knows.
+--- ctl.offline: GetSysDeviceStatus reads the device OFFLINE rather than ONLINE.
 --- ctl.known: false until Director has added the device: every device call answers 0
---- and "Device not found in Zigbee Manager", but GetZdoBindConfig an empty list.
+--- and "Device not found in Zigbee Manager", every getter nil and it, but
+--- GetZdoBindConfig an empty list (617, 09-29).
 --- ctl.asleep: zserver holds a sleepy device's reads until it wakes.
 --- ctl.answers: key (srcEp * 65536 + cluster) -> the status the device answers a bind
 --- or unbind of it with, instead of SUCCESS.
 --- ctl.corrupted: true once a table read was sent while zserver synced, which also
 --- raises; a caller's pcall can swallow the raise.
---- @return table ctl { table, list, held, published, state, syncs, known, asleep, answers,
----   made, live, inits, calls, issued, invalid, queue, corrupted, cb(), deliver(n),
----   accept(n), silence(), restart(), online() }
+--- @return table ctl { table, list, held, published, state, syncs, info, discovery,
+---   offline, known, asleep, answers, made, live, inits, calls, issued, invalid, queue,
+---   corrupted, cb(), deliver(n), accept(n), silence(), restart(), online() }
 function ShimInstallZigbeeV2(opts)
   opts = opts or {}
   local ctl = {
@@ -150,6 +156,9 @@ function ShimInstallZigbeeV2(opts)
     published = {}, -- the list zserver last published, with a state: Director compares with it
     state = nil, -- zserver's state for it
     syncs = 0, -- lists Director sent zserver
+    info = opts.info,
+    discovery = opts.discovery or { status = "DONE", statusInt = 64 },
+    offline = false,
     known = true,
     asleep = false,
     answers = {},
@@ -267,10 +276,10 @@ function ShimInstallZigbeeV2(opts)
 
   -- Director sends a list only when it differs from the one zserver last published: as
   -- many entries, and each found there on cluster and source endpoint, and on what else
-  -- it names, its EUI64 byte for byte. The coordinator named in upper case after none
-  -- was sent, lower after upper sent, and none after lower were skipped. After a
-  -- Director restart the drivers' Sets, 0.4 to 1 s after addZ3Node, were compared with
-  -- the list zserver held before Director's empty one.
+  -- it names, its EUI64 byte for byte. On 619 (09-25) the coordinator named in upper
+  -- case after none was sent, lower after upper sent, and none after lower skipped.
+  -- After a Director restart the drivers' Sets, 0.4 to 1 s after addZ3Node, were
+  -- compared with the list zserver held before Director's empty one (13:54).
   local function found(e)
     for _, p in ipairs(ctl.published) do
       if
@@ -286,7 +295,7 @@ function ShimInstallZigbeeV2(opts)
   end
   -- zserver takes a new list at once, so it replaces a sync still waiting, and is
   -- pending about 5 ms later. What an entry leaves out it fills in: the coordinator's
-  -- EUI64 in lower case and its endpoint; what it names it keeps as given.
+  -- EUI64 in lower case (619's 0xFF03) and its endpoint; what it names it keeps as given.
   local function send(entries)
     local same = #entries == #ctl.published
     for _, e in ipairs(entries) do
@@ -349,7 +358,8 @@ function ShimInstallZigbeeV2(opts)
       ctl.invalid[#ctl.invalid + 1] = cmd
       return 0, NOT_FOUND
     elseif ctl.state == "pending" then
-      -- zserver took the driver's page as its own, counted phantom records, and stalled.
+      -- 674 at 20:28 and 619 after a Director restart: zserver took the driver's page
+      -- as its own, counted phantom records, and stalled.
       ctl.corrupted = true
       error("shim: a table read while zserver syncs corrupts its sync")
     end
@@ -402,6 +412,30 @@ function ShimInstallZigbeeV2(opts)
       }
     end
     return out, ""
+  end
+  local function known()
+    if ctl.known and ctl.info == nil then
+      error("shim: the interview of a device the Zigbee server knows was not given")
+    end
+    return ctl.known
+  end
+  function methods.GetSysDeviceInfo()
+    if not known() then
+      return nil, NOT_FOUND
+    end
+    return ctl.info, ""
+  end
+  function methods.GetSysDeviceDiscovery()
+    if not known() then
+      return nil, NOT_FOUND
+    end
+    return ctl.discovery, ""
+  end
+  function methods.GetSysDeviceStatus()
+    if not ctl.known then
+      return nil, NOT_FOUND
+    end
+    return ctl.offline and { statusInt = 1, status = "OFFLINE" } or { statusInt = 0, status = "ONLINE" }, ""
   end
 
   local mt = {
@@ -519,9 +553,9 @@ function ShimInstallZigbeeV2(opts)
 
   --- Director hears the device ONLINE, as at addZ3Node: it sends its own copy of the
   --- list when it differs from the one zserver last published, an empty one after a
-  --- restart, and the driver first hears the state zserver kept (behind its Set).
+  --- restart, and the driver first hears the state zserver kept (behind its Set, 16:59).
   --- After a restart zserver's own ONLINE for the device, before any state it publishes,
-  --- adds it again, and Director sends its copy again where it differs.
+  --- adds it again, and Director sends its copy again where it differs (09-29 13:49).
   function ctl.online()
     if readd then
       ctl.queue[#ctl.queue + 1] = { kind = "add" }
