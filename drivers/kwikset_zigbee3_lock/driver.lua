@@ -27,7 +27,7 @@ JSON = require("JSON")
 
 local log = require("lib.logging")
 local persist = require("lib.persist")
-local ZBind = require("zigbee.zbind")
+local ZBind = require("zigbee3.zbind")
 --#ifndef DRIVERCENTRAL
 local githubUpdater = require("lib.github-updater")
 --#endif
@@ -46,6 +46,7 @@ local EVENT_BATTERY_LOW = 4
 local PROFILE_HA = 0x0104
 local CLUSTER_BASIC = 0x0000
 local CLUSTER_POWER = 0x0001
+local CLUSTER_POLL_CONTROL = 0x0020
 local CLUSTER_DOORLOCK = 0x0101
 
 -- ZCL global command ids
@@ -721,8 +722,9 @@ local PENDING_RESEND_HOLDOFF = 5 -- seconds; don't re-spam a write that just wen
 -- defined below, and the mutators need the timer.
 local resendPendingEntry
 local armPendingTimer
--- OnZigbeePacketIn triggers the event bind the moment it learns the endpoint,
--- above where the binder is defined.
+-- OnZigbeePacketIn hands the binder the endpoint the moment it learns it, above
+-- where the binder is made.
+local binder
 local establishEventBinds
 
 local function savePending()
@@ -743,10 +745,9 @@ local function updateDriverStatus()
   end
 end
 
--- Without a binding-table entry (nothing populates it on join) the lock pushes
--- nothing on a keypad or thumbturn action, so a modest LockState poll is the
--- only way to see physical operations. Deliberate deviation from the
--- event-driven polling convention.
+-- Until zserver has bound DoorLock, or if the lock refuses the bind, a modest
+-- LockState poll is the only way to see physical operations, so it always runs.
+-- Deliberate deviation from the event-driven polling convention.
 local STATE_POLL_INTERVAL = 30 * ONE_SECOND
 local BATTERY_POLL_INTERVAL = ONE_HOUR
 
@@ -1875,9 +1876,12 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
   if not state.online then
     applyOnline(true)
   end
-  -- With the endpoint now known and the lock awake, establish the event binding
-  -- if it has not been done this session (guarded internally; a no-op otherwise).
+  -- With the endpoint known, hand zserver the event bind (a repeat costs nothing);
+  -- the lock is awake, so the binder asks what an earlier read left open.
   establishEventBinds()
+  if binder then
+    binder:wake()
+  end
   local ok, err = pcall(function()
     local pos, fc = u8(packet, 1)
     local seq, cmd
@@ -2063,50 +2067,55 @@ end
 -- Real-time event bindings (Zigbee 3.0)
 -- ---------------------------------------------------------------------------
 
--- Nothing populates the lock's binding table on join, so it answers polls but
--- never pushes a keypad or thumbturn event. zbind establishes the binding once
--- per load and it persists in the lock across reloads; the status poll stays the
--- fallback. See zbind.lua for the mechanism.
-local binder = ZBind:new()
-local gEventBindDone = false
+-- A lock joins with no DoorLock bind, so it answers polls but never pushes a
+-- keypad or thumbturn event. zbind has zserver keep the DoorLock bind through the
+-- controller's Zigbee API; the status poll stays the fallback.
+local eventBound = false
 
---- Bind the lock's event-bearing clusters to the coordinator so keypad and
---- thumbturn actions arrive in real time. No-op until the lock is online and
---- its application endpoint is known (the bind must name the real endpoint).
---- @param force boolean? re-run even if already done this session
-function establishEventBinds(force)
-  if force then
-    gEventBindDone = false
+--- Make the binder, at late init: Director keeps the lock's bind list across a
+--- driver update only, so any other load starts it stale.
+--- @param driverInitType string|nil
+local function makeBinder(driverInitType)
+  binder = ZBind:new(driverInitType ~= "DIT_UPDATING")
+  binder.address = function()
+    return C4:FindEuidBasedOnNodeId(C4:GetDeviceID())
   end
-  if gEventBindDone or not state.online or not state.dstEndpointLearned then
+  binder.zserverId = function()
+    return C4:FindZserverIDBasedOnNodeId(C4:GetDeviceID())
+  end
+end
+
+--- Give zserver the lock's bind list: DoorLock on its application endpoint, bound
+--- to the coordinator so keypad and thumbturn actions arrive in real time, then
+--- Poll Control. Waits for the endpoint, since an entry on one the lock lacks
+--- disables the list.
+function establishEventBinds()
+  if not binder or not state.dstEndpointLearned then
     return
   end
-  local euid = C4:FindEuidBasedOnNodeId(C4:GetDeviceID())
-  if IsEmpty(euid) then
-    log:debug("establishEventBinds: EUID not resolved yet")
-    return
-  end
-  gEventBindDone = true
-  -- Only DoorLock is bound: the lock pushes operation events for it. It answers
-  -- PowerConfig (battery) reads on request but refuses to bind that cluster for
-  -- reports (verified against the device binding table), so battery stays on the
-  -- hourly poll rather than a real-time report.
-  binder:ensureBinds(euid, {
-    { cluster = CLUSTER_DOORLOCK, srcEp = state.dstEndpoint },
-  }, function(ok)
-    if ok then
-      log:info("Real-time event binding established (endpoint %d)", state.dstEndpoint)
-    else
-      gEventBindDone = false -- let a later online retry
-      log:debug("Real-time event binding not established; relying on status poll")
+  -- PowerConfig is not listed: the lock refuses its bind, so battery stays on the hourly poll.
+  binder:apply({
+    { srcEp = state.dstEndpoint, cluster = CLUSTER_DOORLOCK },
+    -- zserver unbinds what the list leaves out, so the check-in bind the lock joined with
+    -- (to the coordinator's ep1) is listed too: last, so a refusal of it comes after DoorLock is bound.
+    { srcEp = state.dstEndpoint, cluster = CLUSTER_POLL_CONTROL, dstEp = 1 },
+  }, function(settled)
+    if settled and not eventBound then
+      log:info("Real-time event binding in place (endpoint %d)", state.dstEndpoint)
     end
+    eventBound = settled
   end)
 end
 
 function OnZigbeeOnlineStatusChanged(strStatus, strVersion, _strSKU)
   log:trace("OnZigbeeOnlineStatusChanged('%s', '%s')", strStatus, strVersion)
   local online = strStatus ~= "OFFLINE"
+  -- zserver does not sync a rejoined lock again, so one that lost its table is found here.
+  local rejoined = strStatus == "REBOOT" or (online and state.online == false)
   applyOnline(online)
+  if rejoined and binder then
+    binder:check()
+  end
   if online then
     if not IsEmpty(strVersion) then
       UpdateProperty("Firmware Version", strVersion)
@@ -2118,9 +2127,8 @@ function OnZigbeeOnlineStatusChanged(strStatus, strVersion, _strSKU)
     readAttributes(CLUSTER_POWER, { ATTR_BATT_PCT })
     -- Firmware build from the device itself; the callback's version arg is empty.
     readAttributes(CLUSTER_BASIC, { ATTR_SW_BUILD })
-    -- Establish real-time event binding. On a reload the endpoint is already
-    -- known; on a first join it is learned from the reads above and the bind
-    -- fires from the packet-in learn site instead.
+    -- A list refused before Director added the lock goes now; on a first join the
+    -- endpoint comes from the reads above, at packet-in.
     establishEventBinds()
   else
     UpdateProperty("Firmware Version", "--")
@@ -2258,8 +2266,8 @@ function OnDriverInit()
   log:trace("OnDriverInit()")
 end
 
-function OnDriverLateInit()
-  log:trace("OnDriverLateInit()")
+function OnDriverLateInit(driverInitType)
+  log:trace("OnDriverLateInit(%s)", tostring(driverInitType))
   if not CheckMinimumVersion("Driver Status") then
     return
   end
@@ -2288,6 +2296,10 @@ function OnDriverLateInit()
   -- restricted set, which is correct.
   applyUserCodeCapabilities()
   applySettingCapabilities()
+  -- A persisted endpoint gives zserver the event bind now, or after one table read
+  -- when it is the lock's first list; Director skips an unchanged one.
+  makeBinder(driverInitType)
+  establishEventBinds()
   -- Writes owed from before the reload: re-arm the retry window but don't blast
   -- the sleeping lock now - its next inbound packet flushes them.
   armPendingTimer()
@@ -2316,6 +2328,7 @@ end
 
 function OnDriverDestroyed()
   log:trace("OnDriverDestroyed()")
-  -- Release the event-bind socket + its drain timer if a bootstrap is mid-flight.
-  binder:close()
+  if binder then
+    binder:close()
+  end
 end

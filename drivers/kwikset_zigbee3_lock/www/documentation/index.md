@@ -63,7 +63,7 @@ the standard Control4 lock interface.
 
 # <span style="color:#D12231">System Requirements</span>
 
-- Control4 OS 4.2.0 or later
+- Control4 OS 4.3.0 or later
 - A controller running a **Zigbee 3.0** mesh with an open network
 - A Kwikset SmartCode deadbolt or lever with a **Zigbee 3.0** radio (see
   [Compatibility](#compatibility))

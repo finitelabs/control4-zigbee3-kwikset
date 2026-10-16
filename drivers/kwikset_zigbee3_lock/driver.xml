@@ -12,7 +12,7 @@
   <version/>
   <created>07/20/2026 12:00:00 PM</created>
   <modified/>
-  <minimum_os_version>4.2.0</minimum_os_version>
+  <minimum_os_version>4.3.0</minimum_os_version>
   <composer_categories>
     <category>Locks</category>
   </composer_categories>

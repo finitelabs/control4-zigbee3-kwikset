@@ -40,7 +40,7 @@ the standard Control4 lock interface.
 
 # <span style="color:#D12231">System Requirements</span>
 
-- Control4 OS 4.2.0 or later
+- Control4 OS 4.3.0 or later
 - A controller running a **Zigbee 3.0** mesh with an open network
 - A Kwikset SmartCode deadbolt or lever with a **Zigbee 3.0** radio (see
   [Compatibility](#compatibility))
@@ -288,6 +288,11 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Fixed one-touch locking that had been turned off showing as on after a driver
   update or controller reboot, where a change the lock had not yet confirmed
   could be sent to it as on; the setting now loads as it was saved
+
+### Changed
+
+- Changed the lock's real-time binding to go through the controller's Zigbee
+  API, so keypad, thumbturn, and one-touch operations show as they happen
 
 ## v20260825 - 2026-08-25
 
