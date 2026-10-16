@@ -267,4 +267,12 @@ function F.fire(name)
   ShimPersistLand()
 end
 
+--- Run one expiry of a repeating timer now, leaving it armed for the next.
+function F.tick(name)
+  local h = Timer[name]
+  ShimPersistLand()
+  TimerFunctions[h](h, 0)
+  ShimPersistLand()
+end
+
 return F

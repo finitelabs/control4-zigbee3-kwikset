@@ -303,8 +303,9 @@ Locks the lock if it is unlocked, and unlocks it if it is locked.
 
 #### Sync Users
 
-Re-sends every stored user code and schedule to the lock. Use this if the lock
-was reset or you suspect its codes are out of sync with the project.
+Re-sends every stored user code and schedule to the lock, and any user deletion
+the lock has not confirmed. Use this if the lock was reset or you suspect its
+codes are out of sync with the project.
 
 #### Get Battery Status
 

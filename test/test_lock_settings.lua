@@ -60,9 +60,17 @@ local function reads(frames)
   return out
 end
 
---- Front Porch online, its settings read answered with `records`.
-local function online(records)
-  F.start(F.KEYPAD)
+--- Front Porch online over the keypad lock's store and `extra`, its settings read
+--- answered with `records`.
+local function online(records, extra)
+  local seed = {}
+  for k, v in pairs(F.KEYPAD) do
+    seed[k] = v
+  end
+  for k, v in pairs(extra or {}) do
+    seed[k] = v
+  end
+  F.start(seed)
   OnZigbeeOnlineStatusChanged("ONLINE", "", "")
   F.sent()
   F.readResponse(records)
@@ -95,6 +103,24 @@ do
   T.contains("they give the lock's volume", settings, "<volume>high</volume>")
   T.contains("and its auto-lock time", settings, "<auto_lock_time>0</auto_lock_time>")
   T.eq("a change to it is not written", set("SET_ONE_TOUCH_LOCKING", { ENABLED = "true" }), {})
+  told = F.told()
+  T.eq("nor told to the proxy as a value", F.last(told, "SETTING_CHANGED"), nil)
+  T.contains("the proxy is answered with the settings", F.last(told, "SETTINGS"), "<lock_settings>")
+  T.excludes("which leave it out", F.last(told, "SETTINGS"), "one_touch_locking")
+end
+
+--------------------------------------------------------------------------------
+T.section("one-touch locking stored by an earlier build is not offered either")
+--------------------------------------------------------------------------------
+do
+  online(FRONT_PORCH, { oneTouchLocking = true })
+  F.proxy("REQUEST_SETTINGS")
+  T.excludes("the settings do not claim it", F.last(F.told(), "SETTINGS"), "one_touch_locking")
+  T.eq("a change to it is not written", set("SET_ONE_TOUCH_LOCKING", { ENABLED = "false" }), {})
+  local told = F.told()
+  T.eq("nor is the stored value told", F.last(told, "SETTING_CHANGED"), nil)
+  T.contains("the proxy is answered with the settings", F.last(told, "SETTINGS"), "<lock_settings>")
+  T.excludes("which leave it out", F.last(told, "SETTINGS"), "one_touch_locking")
 end
 
 --------------------------------------------------------------------------------
@@ -107,6 +133,10 @@ do
   T.excludes("no volume is made up", settings, "<volume>")
   T.excludes("nor one-touch locking", settings, "one_touch_locking")
   T.eq("a volume change is not written", set("SET_VOLUME", { VOLUME = "silent" }), {})
+  local told = F.told()
+  T.eq("nor told to the proxy as a value", F.last(told, "SETTING_CHANGED"), nil)
+  T.contains("the proxy is answered with the settings", F.last(told, "SETTINGS"), "<lock_settings>")
+  T.excludes("which leave it out", F.last(told, "SETTINGS"), "<volume>")
 end
 
 --------------------------------------------------------------------------------

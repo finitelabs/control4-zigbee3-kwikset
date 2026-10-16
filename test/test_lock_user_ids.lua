@@ -63,6 +63,27 @@ local function answer(seqs, zero, top)
   end
 end
 
+--- The user ids the `cmd` commands among `frames` name.
+local function named(frames, cmd)
+  local ids = {}
+  for _, f in ipairs(F.only(frames, cmd)) do
+    ids[#ids + 1] = F.userId(f)
+  end
+  return ids
+end
+
+--- Whether a Read Attributes among `frames` asks for `attr`.
+local function reads(frames, attr)
+  for _, f in ipairs(F.only(frames, 0x00, false)) do
+    for at = 1, #f.payload - 1, 2 do
+      if f.payload:byte(at) + f.payload:byte(at + 1) * 256 == attr then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 --- Add a user as the proxy does, and return the ids its PIN went to.
 local function add(code)
   F.sent()
@@ -169,6 +190,132 @@ do
   T.eq("the next to id 2, while id 1's clear is owed", add("8765"), { 2 })
   F.receive(F.DOORLOCK, true, clears[1].seq, F.CLEAR_PIN, string.char(0))
   T.eq("once the lock confirms it, id 1 is free", add("1357"), { 1 })
+end
+
+--------------------------------------------------------------------------------
+T.section("a deleted user's id stays taken when the lock refuses its clear")
+--------------------------------------------------------------------------------
+do
+  answer(online(FRONT_PORCH), true, false)
+  F.sent()
+  F.proxy("DELETE_USER", { USER_ID = "1" })
+  local clears = F.only(F.sent(), F.CLEAR_PIN)
+  F.told()
+  F.receive(F.DOORLOCK, true, clears[1] and clears[1].seq or 0xEE, F.CLEAR_PIN, string.char(1))
+  local n = F.last(F.told(), "LOCK_STATUS_CHANGED")
+  T.eq(
+    "the refusal is shown",
+    n and n.LAST_ACTION_DESCRIPTION,
+    "Deleted User 1 (Derek) - rejected by lock (status 0x01)"
+  )
+  F.reload()
+  T.eq("a new user goes to id 0", add("5678"), { 0 })
+  T.eq("the next to id 2, while the old code may still open the door", add("8765"), { 2 })
+
+  F.sent()
+  EC.Sync_Users({})
+  local sync = F.sent()
+  local again
+  for _, f in ipairs(F.only(sync, F.CLEAR_PIN)) do
+    if F.userId(f) == 1 then
+      again = f
+    end
+  end
+  T.check("Sync Users clears id 1 again", again ~= nil, T.show(named(sync, F.CLEAR_PIN)))
+  F.receive(F.DOORLOCK, true, again and again.seq or 0xEE, F.CLEAR_PIN, string.char(0))
+  T.eq("once the lock confirms it, id 1 is free", add("1357"), { 1 })
+end
+
+--------------------------------------------------------------------------------
+T.section("a deleted user's id stays taken when the lock never confirms its clear")
+--------------------------------------------------------------------------------
+do
+  answer(online(FRONT_PORCH), true, false)
+  F.proxy("DELETE_USER", { USER_ID = "1" })
+  F.told()
+  for _ = 1, 11 do
+    if Timer.PendingWrites then
+      F.tick("PendingWrites")
+    end
+  end
+  local n = F.last(F.told(), "LOCK_STATUS_CHANGED")
+  T.eq("the delete fails", n and n.LAST_ACTION_DESCRIPTION, "Deleted User 1 (Derek) - not confirmed by lock")
+  T.eq("a new user goes to id 0", add("5678"), { 0 })
+  T.eq("the next to id 2", add("8765"), { 2 })
+end
+
+--------------------------------------------------------------------------------
+T.section("only a keypad or RFID operation names a user, whatever id the lock reports")
+--------------------------------------------------------------------------------
+do
+  local seed = store({ [2] = { name = "Guest", code = "5678", active = true, slot = 0 } })
+  seed.userIds = { first = 0, last = 29 }
+  F.start(seed)
+  --- The lock reports an operation by `src` with event `code` and user `uid` (0 if nil).
+  local function operation(src, code, uid)
+    F.told()
+    F.receive(F.DOORLOCK, true, 0x31, F.OPER_EVENT, string.char(src, code) .. F.u16(uid or 0) .. string.rep("\0", 9))
+    local n = F.last(F.told(), "LOCK_STATUS_CHANGED")
+    return n and { n.SOURCE, n.LAST_ACTION_DESCRIPTION }
+  end
+
+  F.proxy("LOCK")
+  T.eq("Control4's own lock reads Control4", operation(0x01, 0x01), { "Control4", "Locked (Control4)" })
+  T.eq("a thumbturn unlock reads Manual", operation(0x02, 0x0e), { "Manual", "Unlocked (Manual)" })
+  T.eq("a keypad lock names the user at slot 0", operation(0x00, 0x01), { "Guest", "Locked by Guest (Keypad)" })
+  T.eq("an RFID unlock does too", operation(0x03, 0x02), { "Guest", "Unlocked by Guest (RFID)" })
+  T.eq(
+    "a keypad lock by an id no user holds reads its number",
+    operation(0x00, 0x01, 5),
+    { "User 5", "Locked by User 5 (Keypad)" }
+  )
+end
+
+--------------------------------------------------------------------------------
+T.section("a probe answer the lock missed is asked for again")
+--------------------------------------------------------------------------------
+do
+  -- Front Porch's verdicts from an earlier online, so only the user ids are open.
+  local function resolved(users)
+    local seed = store(users)
+    seed.settingSupport = {
+      ["attr:autolock"] = true,
+      ["attr:volume"] = true,
+      ["attr:onetouch"] = false,
+      ["attr:wrongcode"] = true,
+      ["attr:shutout"] = true,
+    }
+    F.start(seed)
+    OnZigbeeOnlineStatusChanged("ONLINE", "", "")
+    F.sent()
+    F.readResponse({ F.attr(0x0012, 0x21, 30) })
+    local seqs = {}
+    for _, f in ipairs(F.only(F.sent(), F.GET_PIN)) do
+      seqs[F.userId(f)] = f.seq
+    end
+    return seqs
+  end
+
+  local seqs = resolved(FRONT_PORCH)
+  F.getPinResponse(seqs[0] or 0xEE, 0, 0)
+  T.check("with id 30's answer lost, the probe goes on", Timer.CapProbe ~= nil)
+  if Timer.CapProbe then
+    F.fire("CapProbe")
+  end
+  local reread = reads(F.sent(), 0x0012)
+  T.check("its next round reads N again", reread)
+  if reread then
+    F.readResponse({ F.attr(0x0012, 0x21, 30) })
+  end
+  local asked = F.only(F.sent(), F.GET_PIN)
+  T.eq("and asks for id 30 alone", named(asked, F.GET_PIN), { 30 })
+  F.told()
+  F.defaultResponse(asked[1] and asked[1].seq or 0xEE, F.GET_PIN, INVALID_FIELD)
+  T.eq("the range settles", F.stored("userIds"), { first = 0, last = 29 })
+  T.eq("and the proxy is told 30 users", F.capability(F.told(), "max_users"), "30")
+
+  answer(resolved(FRONT_PORCH), true, false)
+  T.eq("both answered at once, the probe stops", Timer.CapProbe, nil)
 end
 
 T.finish()
