@@ -58,6 +58,7 @@ local ZCL_REPORT_ATTR = 0x0a
 local ZCL_DEFAULT_RESPONSE = 0x0b -- <cmdId:u8> <status:u8>
 local ZCL_STATUS_UNSUP_CMD = 0x81 -- UNSUP_CLUSTER_COMMAND
 local ZCL_STATUS_UNSUP_ATTR = 0x86 -- UNSUPPORTED_ATTRIBUTE
+local ZCL_STATUS_INVALID_VALUE = 0x87 -- INVALID_VALUE
 
 -- DoorLock cluster-specific command ids (client -> server)
 local DL_LOCK = 0x00 -- <pin:octstr>
@@ -193,9 +194,8 @@ local state = {
   action = nil, -- last applied transition, for coalescing dual reports (ephemeral)
   logSupported = nil, -- true if the lock has an event log (attr 0x0010 > 0)
   lastLogEntryId = nil, -- newest event-log id already attributed, to skip repeats
-  -- Lock-side config settings. nil = never configured here: the first value the
-  -- lock reports is adopted as desired; once set from Control4, desired wins
-  -- and drift on the lock is re-asserted.
+  -- Lock-side config settings, nil until the lock reports a value. The lock's
+  -- value is adopted; a Control4 change goes to the lock as an owed write.
   autoLockSeconds = nil,
   volume = nil, -- "silent" | "low" | "high"
   oneTouchLocking = nil,
@@ -222,6 +222,9 @@ local state = {
   -- restrictive driver.xml defaults. false hides the setting via
   -- CAPABILITY_CHANGED. (persisted)
   settingSupport = {},
+  -- Setting values the lock refused, by setting key and ZCL value, and the
+  -- firmware build that refused them (persisted).
+  refused = { values = {} },
   -- Lock capability limits, read from the DoorLock cluster at online. Seeded
   -- with the SmartCode Convert's known values so validation works before the
   -- lock reports.
@@ -423,26 +426,6 @@ local function notifyBattery()
   if state.battery ~= nil then
     notify("BATTERY_STATUS_CHANGED", { BATTERY_STATUS = batteryStatus(state.battery) })
   end
-end
-
-local function notifySettings()
-  log:trace("notifySettings()")
-  local oneTouch = state.oneTouchLocking
-  if oneTouch == nil then
-    oneTouch = true
-  end
-  local body = XMLTag("admin_code", state.adminCode)
-    .. XMLTag("auto_lock_time", state.autoLockSeconds or 0)
-    .. XMLTag("log_item_count", state.logItemCount)
-    .. XMLTag("schedule_lockout_enabled", tostring(state.scheduleLockoutEnabled))
-    .. XMLTag("lock_mode", "normal")
-    .. XMLTag("log_failed_attempts", "false")
-    .. XMLTag("wrong_code_attempts", state.wrongCodeAttempts or 3)
-    .. XMLTag("shutout_timer", state.shutoutTimer or 60)
-    .. XMLTag("language", "English")
-    .. XMLTag("volume", state.volume or "high")
-    .. XMLTag("one_touch_locking", tostring(oneTouch))
-  notify("SETTINGS", XMLTag("lock_settings", body, nil, false))
 end
 
 --- The lock's user ids: what its answers to the edge probe settled, else 1 to
@@ -711,6 +694,8 @@ local function loadState()
   -- OnDriverLateInit and flushed when the lock next speaks.
   state.pending = persist:get("pendingWrites", {}) or {}
   state.settingSupport = persist:get("settingSupport", {}) or {}
+  local refused = persist:get("settingRefused", nil)
+  state.refused = type(refused) == "table" and type(refused.values) == "table" and refused or { values = {} }
   -- A stored value is the last verdict; unknown defaults to no keypad, so user
   -- management stays hidden until the lock proves it (restrictive default).
   state.supportsUserCodes = toboolean(persist:get("supportsUserCodes", false))
@@ -736,6 +721,7 @@ local PENDING_RESEND_HOLDOFF = 5 -- seconds; don't re-spam a write that just wen
 -- defined below, and the mutators need the timer.
 local resendPendingEntry
 local armPendingTimer
+local refuseSettingValue
 -- OnZigbeePacketIn hands the binder the endpoint the moment it learns it, above
 -- where the binder is made.
 local binder
@@ -808,6 +794,7 @@ local function markPendingSent(key, seq)
   local e = state.pending[key]
   if e then
     e.lastSent = os.time()
+    e.seq = seq
     state.pendingSeq[seq] = key
   end
 end
@@ -873,8 +860,12 @@ local function confirmSeq(seq, status)
     return
   end
   state.pendingSeq[seq] = nil
+  local e = state.pending[key]
   if status == 0 then
     confirmPending(key)
+  elseif e and e.kind == "attr" and status == ZCL_STATUS_INVALID_VALUE then
+    -- A setting the lock has, refusing the value (low volume on a 916).
+    refuseSettingValue(key, seq)
   else
     failPending(key, string.format("rejected by lock (status 0x%02x)", status))
   end
@@ -1232,62 +1223,74 @@ local function writeUserSchedule(id, u)
   end
 end
 
+--- Seconds as the proxy's auto-lock and shutout lists show them.
+--- @param v integer
+local function secondsText(v)
+  if v >= 60 and v % 60 == 0 then
+    return string.format("%d min", v / 60)
+  end
+  return string.format("%d sec", v)
+end
+
+local function identity(v)
+  return v
+end
+
 -- ZCL-backed lock settings, keyed by their owed-write key. Each entry knows its
--- attribute, ZCL type, the desired value (with the pre-adoption default), and
--- how to adopt a lock-reported value as desired. rawGet() returning nil means
--- the installer never configured the setting here.
+-- attribute and ZCL type, its state field (also its persist key), its proxy
+-- setting name, how its value maps to the ZCL value, and how history names it.
+-- A setting with a value list offers the driver.xml list less what the lock
+-- refused, plus the lock's own value when the list lacks it.
 local SETTING_ATTRS = {
   ["attr:autolock"] = {
     attr = ATTR_AUTO_RELOCK,
     cap = "has_auto_lock_time",
-    type = 0x23, -- u32
-    rawGet = function()
-      return state.autoLockSeconds
+    type = 0x23, -- u32 seconds, 0 = off
+    field = "autoLockSeconds",
+    name = "auto_lock_time",
+    label = "Auto lock",
+    toZcl = identity,
+    fromZcl = identity,
+    text = function(v)
+      return v == 0 and "OFF" or secondsText(v)
     end,
-    get = function()
-      return state.autoLockSeconds or 0
-    end,
-    adopt = function(v)
-      state.autoLockSeconds = v
-      persist:set("autoLockSeconds", v)
-      notify("SETTING_CHANGED", { NAME = "auto_lock_time", VALUE = tostring(v) })
-    end,
+    list = {
+      cap = "auto_lock_time_values",
+      displayCap = "auto_lock_time_display_values",
+      values = { 0, 15, 30, 60, 120, 180, 300, 600, 1200, 1800 },
+    },
   },
   ["attr:volume"] = {
     attr = ATTR_SOUND_VOLUME,
     cap = "has_volume",
     type = 0x20, -- u8
-    rawGet = function()
-      return state.volume
+    field = "volume",
+    name = "volume",
+    label = "Keypad volume",
+    toZcl = function(v)
+      return VOLUME_TO_ZCL[v]
     end,
-    get = function()
-      return VOLUME_TO_ZCL[state.volume or "high"] or 2
+    fromZcl = function(z)
+      return ZCL_TO_VOLUME[z]
     end,
-    adopt = function(v)
-      state.volume = ZCL_TO_VOLUME[v] or "high"
-      persist:set("volume", state.volume)
-      notify("SETTING_CHANGED", { NAME = "volume", VALUE = state.volume })
-    end,
+    text = tostring,
   },
   ["attr:onetouch"] = {
     attr = ATTR_ONE_TOUCH_LOCKING,
     cap = "has_one_touch_locking",
     keypadOnly = true,
     type = 0x10, -- bool
-    rawGet = function()
-      return state.oneTouchLocking
+    field = "oneTouchLocking",
+    name = "one_touch_locking",
+    label = "One touch locking",
+    toZcl = function(v)
+      return v and 1 or 0
     end,
-    get = function()
-      local enabled = state.oneTouchLocking
-      if enabled == nil then
-        enabled = true
-      end
-      return enabled and 1 or 0
+    fromZcl = function(z)
+      return z ~= 0
     end,
-    adopt = function(v)
-      state.oneTouchLocking = v ~= 0
-      persist:set("oneTouchLocking", state.oneTouchLocking)
-      notify("SETTING_CHANGED", { NAME = "one_touch_locking", VALUE = tostring(state.oneTouchLocking) })
+    text = function(v)
+      return v and "on" or "off"
     end,
   },
   ["attr:wrongcode"] = {
@@ -1295,43 +1298,69 @@ local SETTING_ATTRS = {
     cap = "has_wrong_code_attempts",
     keypadOnly = true,
     type = 0x20, -- u8
-    rawGet = function()
-      return state.wrongCodeAttempts
-    end,
-    get = function()
-      return state.wrongCodeAttempts or 3
-    end,
-    adopt = function(v)
-      state.wrongCodeAttempts = v
-      persist:set("wrongCodeAttempts", v)
-      notify("SETTING_CHANGED", { NAME = "wrong_code_attempts", VALUE = tostring(v) })
-    end,
+    field = "wrongCodeAttempts",
+    name = "wrong_code_attempts",
+    label = "Wrong code attempts",
+    toZcl = identity,
+    fromZcl = identity,
+    text = tostring,
+    list = { cap = "wrong_code_attempts_values", values = { 1, 2, 3, 4, 5, 6, 7 } },
   },
   ["attr:shutout"] = {
     attr = ATTR_SHUTOUT_TIME,
     cap = "has_shutout_timer",
     keypadOnly = true,
-    type = 0x20, -- u8
-    rawGet = function()
-      return state.shutoutTimer
-    end,
-    get = function()
-      return state.shutoutTimer or 60
-    end,
-    adopt = function(v)
-      state.shutoutTimer = v
-      persist:set("shutoutTimer", v)
-      notify("SETTING_CHANGED", { NAME = "shutout_timer", VALUE = tostring(v) })
-    end,
+    type = 0x20, -- u8 seconds
+    field = "shutoutTimer",
+    name = "shutout_timer",
+    label = "Shutout timer",
+    toZcl = identity,
+    fromZcl = identity,
+    text = secondsText,
+    list = {
+      cap = "shutout_timer_values",
+      displayCap = "shutout_timer_display_values",
+      values = { 5, 10, 30, 60, 120 },
+    },
   },
 }
+
+--- Whether the lock refused a setting's ZCL value (on its current firmware).
+local function isRefused(key, z)
+  local values = state.refused.values[key]
+  return values ~= nil and values[tostring(z)] == true
+end
+
+--- Tell the proxy the values a list-backed setting offers.
+local function notifySettingValues(key)
+  local s = SETTING_ATTRS[key]
+  local current = state[s.field]
+  local values = {}
+  for _, v in ipairs(s.list.values) do
+    if v ~= current and not isRefused(key, v) then
+      values[#values + 1] = v
+    end
+  end
+  if current ~= nil then
+    values[#values + 1] = current
+    table.sort(values)
+  end
+  local texts = {}
+  for i, v in ipairs(values) do
+    texts[i] = s.text(v)
+  end
+  notify("CAPABILITY_CHANGED", { NAME = s.list.cap, VALUE = table.concat(values, ", ") })
+  if s.list.displayCap then
+    notify("CAPABILITY_CHANGED", { NAME = s.list.displayCap, VALUE = table.concat(texts, ",") })
+  end
+end
 
 --- Write a ZCL-backed setting's desired value to the lock via a global Write
 --- Attributes frame, tied to its owed-write entry.
 local function writeSettingAttr(key)
   log:trace("writeSettingAttr(%s)", key)
   local s = SETTING_ATTRS[key]
-  local v = s.get()
+  local v = s.toZcl(state[s.field])
   local payload
   if s.type == 0x23 then
     payload = u16le(s.attr) .. string.char(s.type) .. u32le(v)
@@ -1339,6 +1368,22 @@ local function writeSettingAttr(key)
     payload = u16le(s.attr) .. string.char(s.type) .. string.char(v % 256)
   end
   markPendingSent(key, writeAttributes(CLUSTER_DOORLOCK, payload))
+end
+
+--- Take a value the lock holds as the setting's, and tell the proxy.
+local function adoptSetting(key, z)
+  local s = SETTING_ATTRS[key]
+  local v = s.fromZcl(z)
+  if v == nil then
+    return
+  end
+  state[s.field] = v
+  persist:set(s.field, v)
+  notify("SETTING_CHANGED", { NAME = s.name, VALUE = tostring(v) })
+  if s.list then
+    notifySettingValues(key)
+    notify("LOCK_CAPABILITIES_CHANGED", {})
+  end
 end
 
 --- Reconcile a lock-reported setting: the lock is the source of truth. A
@@ -1351,8 +1396,9 @@ local function reconcileSetting(key, reported)
   if state.pending[key] ~= nil then
     return
   end
-  if s.rawGet() == nil or s.get() ~= reported then
-    s.adopt(reported)
+  local current = state[s.field]
+  if current == nil or s.toZcl(current) ~= reported then
+    adoptSetting(key, reported)
   end
 end
 
@@ -1368,6 +1414,55 @@ local function settingCapEnabled(key)
     return false
   end
   return true
+end
+
+--- Take a Control4 change to a lock setting. It is written, as an owed write,
+--- only when the lock offers the setting and has not refused the value.
+--- @param key string
+--- @param v any The value in the proxy's terms; nil for none it can take.
+local function takeSetting(key, v)
+  local s = SETTING_ATTRS[key]
+  local current = state[s.field]
+  if v ~= nil and v ~= current and settingCapEnabled(key) then
+    if isRefused(key, s.toZcl(v)) then
+      notifyLockChanged(string.format("%s %s - Not supported by this device", s.label, s.text(v)), "Control4", false)
+    else
+      current = v
+      state[s.field] = v
+      persist:set(s.field, v)
+      registerPending(key, "attr", s.attr, nil, nil)
+      writeSettingAttr(key)
+    end
+  end
+  -- The echo releases the proxy's settings UI, with the value that stands.
+  if current == nil then
+    current = v
+  end
+  if current ~= nil then
+    notify("SETTING_CHANGED", { NAME = s.name, VALUE = tostring(current) })
+  end
+end
+
+--- The lock refused the value written for a setting: say so, write it no more,
+--- and read back the value the lock kept. A refusal of a write a newer one has
+--- replaced is left to that one's answer.
+refuseSettingValue = function(key, seq)
+  local e = state.pending[key]
+  if e == nil or e.seq ~= seq then
+    return
+  end
+  local s = SETTING_ATTRS[key]
+  local v = state[s.field]
+  local refused = state.refused.values
+  refused[key] = refused[key] or {}
+  refused[key][tostring(s.toZcl(v))] = true
+  persist:set("settingRefused", state.refused)
+  cancelPending(key)
+  local msg = string.format("%s %s - Not supported by this device", s.label, s.text(v))
+  log:info("Lock refused %s", msg)
+  addHistory(msg, "Control4")
+  notifyLockChanged(msg, "Control4", false)
+  readAttributes(CLUSTER_DOORLOCK, { s.attr })
 end
 
 --- Record whether the lock supports a ZCL-backed setting and show/hide its
@@ -1398,14 +1493,61 @@ local function setSettingSupport(key, supported)
   end
 end
 
---- Replay every ZCL-backed setting's effective capability to the proxy. Unknown
---- attributes count as unsupported (matching the restrictive driver.xml
---- defaults), and keypad-only settings stay hidden until a keypad is confirmed.
+--- Replay every ZCL-backed setting's effective capability, and the values each
+--- list-backed one offers, to the proxy. Unknown attributes count as unsupported
+--- (matching the restrictive driver.xml defaults), and keypad-only settings stay
+--- hidden until a keypad is confirmed.
 applySettingCapabilities = function()
   for key, s in pairs(SETTING_ATTRS) do
     notify("CAPABILITY_CHANGED", { NAME = s.cap, VALUE = settingCapEnabled(key) and "true" or "false" })
+    if s.list then
+      notifySettingValues(key)
+    end
   end
   notify("LOCK_CAPABILITIES_CHANGED", {})
+end
+
+--- Refusals hold for the firmware that made them: other firmware is offered
+--- every value again.
+--- @param build string The lock's SWBuildID.
+local function noteFirmware(build)
+  local r = state.refused
+  if r.build == build then
+    return
+  end
+  if r.build ~= nil and next(r.values) ~= nil then
+    log:info("Lock firmware is now %s; offering again what %s refused", build, r.build)
+    r.values = {}
+    applySettingCapabilities()
+  end
+  r.build = build
+  persist:set("settingRefused", r)
+end
+
+--- The lock's settings for the proxy. A lock setting is listed only when the
+--- lock offers it, with the value it holds; none is made up for one it lacks.
+local function notifySettings()
+  log:trace("notifySettings()")
+  local function setting(key)
+    local s = SETTING_ATTRS[key]
+    local v = state[s.field]
+    if v == nil or not settingCapEnabled(key) then
+      return ""
+    end
+    return XMLTag(s.name, tostring(v))
+  end
+  local body = XMLTag("admin_code", state.adminCode)
+    .. setting("attr:autolock")
+    .. XMLTag("log_item_count", state.logItemCount)
+    .. XMLTag("schedule_lockout_enabled", tostring(state.scheduleLockoutEnabled))
+    .. XMLTag("lock_mode", "normal")
+    .. XMLTag("log_failed_attempts", "false")
+    .. setting("attr:wrongcode")
+    .. setting("attr:shutout")
+    .. XMLTag("language", "English")
+    .. setting("attr:volume")
+    .. setting("attr:onetouch")
+  notify("SETTINGS", XMLTag("lock_settings", body, nil, false))
 end
 
 -- ---------------------------------------------------------------------------
@@ -1771,17 +1913,7 @@ function RFP.SET_AUTO_LOCK_SECONDS(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local secs = tointeger(Select(tParams, "SECONDS")) or 0
-  if secs == state.autoLockSeconds then
-    -- Nothing owed to the lock, but the echo still releases the settings UI.
-    notify("SETTING_CHANGED", { NAME = "auto_lock_time", VALUE = tostring(secs) })
-    return
-  end
-  state.autoLockSeconds = secs
-  persist:set("autoLockSeconds", secs)
-  registerPending("attr:autolock", "attr", ATTR_AUTO_RELOCK, nil, nil)
-  writeSettingAttr("attr:autolock")
-  notify("SETTING_CHANGED", { NAME = "auto_lock_time", VALUE = tostring(secs) })
+  takeSetting("attr:autolock", tointeger(Select(tParams, "SECONDS")))
 end
 
 function RFP.SET_ADMIN_CODE(idBinding, strCommand, tParams)
@@ -1836,25 +1968,8 @@ function RFP.SET_VOLUME(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local volume = tostring(Select(tParams, "VOLUME") or "high")
-  if VOLUME_TO_ZCL[volume] == nil then
-    volume = "high"
-  end
-  -- Kwikset SmartCode Zigbee locks expose only silent and high; the lock rejects
-  -- the ZCL "low" value (INVALID_VALUE), so fold "low" into "high" to keep keypad
-  -- feedback audible and the proxy, persistence, and lock in agreement.
-  if volume == "low" then
-    volume = "high"
-  end
-  if volume == state.volume then
-    notify("SETTING_CHANGED", { NAME = "volume", VALUE = volume })
-    return
-  end
-  state.volume = volume
-  persist:set("volume", volume)
-  registerPending("attr:volume", "attr", ATTR_SOUND_VOLUME, nil, nil)
-  writeSettingAttr("attr:volume")
-  notify("SETTING_CHANGED", { NAME = "volume", VALUE = volume })
+  local volume = tostring(Select(tParams, "VOLUME"))
+  takeSetting("attr:volume", VOLUME_TO_ZCL[volume] and volume or nil)
 end
 
 function RFP.SET_ONE_TOUCH_LOCKING(idBinding, strCommand, tParams)
@@ -1862,16 +1977,11 @@ function RFP.SET_ONE_TOUCH_LOCKING(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local enabled = toboolean(Select(tParams, "ENABLED")) or false
-  if enabled == state.oneTouchLocking then
-    notify("SETTING_CHANGED", { NAME = "one_touch_locking", VALUE = tostring(enabled) })
-    return
+  local enabled = Select(tParams, "ENABLED")
+  if enabled ~= nil then
+    enabled = toboolean(enabled)
   end
-  state.oneTouchLocking = enabled
-  persist:set("oneTouchLocking", enabled)
-  registerPending("attr:onetouch", "attr", ATTR_ONE_TOUCH_LOCKING, nil, nil)
-  writeSettingAttr("attr:onetouch")
-  notify("SETTING_CHANGED", { NAME = "one_touch_locking", VALUE = tostring(enabled) })
+  takeSetting("attr:onetouch", enabled)
 end
 
 function RFP.SET_WRONG_CODE_ATTEMPTS(idBinding, strCommand, tParams)
@@ -1879,16 +1989,7 @@ function RFP.SET_WRONG_CODE_ATTEMPTS(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local count = tointeger(Select(tParams, "COUNT")) or 3
-  if count == state.wrongCodeAttempts then
-    notify("SETTING_CHANGED", { NAME = "wrong_code_attempts", VALUE = tostring(count) })
-    return
-  end
-  state.wrongCodeAttempts = count
-  persist:set("wrongCodeAttempts", count)
-  registerPending("attr:wrongcode", "attr", ATTR_WRONG_CODE_LIMIT, nil, nil)
-  writeSettingAttr("attr:wrongcode")
-  notify("SETTING_CHANGED", { NAME = "wrong_code_attempts", VALUE = tostring(count) })
+  takeSetting("attr:wrongcode", tointeger(Select(tParams, "COUNT")))
 end
 
 function RFP.SET_SHUTOUT_TIMER(idBinding, strCommand, tParams)
@@ -1896,16 +1997,7 @@ function RFP.SET_SHUTOUT_TIMER(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local secs = tointeger(Select(tParams, "SECONDS")) or 60
-  if secs == state.shutoutTimer then
-    notify("SETTING_CHANGED", { NAME = "shutout_timer", VALUE = tostring(secs) })
-    return
-  end
-  state.shutoutTimer = secs
-  persist:set("shutoutTimer", secs)
-  registerPending("attr:shutout", "attr", ATTR_SHUTOUT_TIME, nil, nil)
-  writeSettingAttr("attr:shutout")
-  notify("SETTING_CHANGED", { NAME = "shutout_timer", VALUE = tostring(secs) })
+  takeSetting("attr:shutout", tointeger(Select(tParams, "SECONDS")))
 end
 
 -- Settings the proxy may send that have no ZCL mapping (kept for parity).
@@ -2024,6 +2116,7 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         local swBuild = decodeStringAttr(payload, cmd, ATTR_SW_BUILD)
         if not IsEmpty(swBuild) then
           UpdateProperty("Firmware Version", swBuild)
+          noteFirmware(swBuild)
         end
       end
     elseif clusterId == CLUSTER_DOORLOCK then

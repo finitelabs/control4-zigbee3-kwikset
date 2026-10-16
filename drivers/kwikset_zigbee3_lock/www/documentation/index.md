@@ -279,6 +279,13 @@ driver's Properties tab:
 > sleepy battery device) acknowledges a change, the driver reports _Applying
 > lock changes..._; on first join the driver adopts the lock's current settings
 > rather than overwriting them.
+>
+> Only the settings the lock reports are shown; a SmartCode 10 Touchscreen, for
+> example, has no One Touch Locking setting. A value the lock refuses is
+> reported as _Not supported by this device_ in the lock's last action and
+> history and is not sent to the lock again; Auto Lock, Wrong Code Attempts, and
+> Shutout Timer drop it from their lists, and add a value set at the lock
+> itself. A firmware update on the lock offers every value again.
 
 ### Driver Actions
 

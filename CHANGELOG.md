@@ -32,11 +32,18 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Fixed date-range user schedules starting and ending hours late by the
   controller's offset from UTC (5 hours in US Central summer time): the dates
   and times now go to the lock in its own local time
+- Fixed lock settings the lock does not have, such as one-touch locking on the
+  SmartCode 10 Touchscreen, being shown as on and sent to the lock: only the
+  settings the lock reports are offered, and a value it refuses now reads "Not
+  supported by this device" and is not sent again (keypad volume low used to be
+  turned into high)
 
 ### Changed
 
 - Changed the lock's real-time binding to go through the controller's Zigbee
   API, so keypad, thumbturn, and one-touch operations show as they happen
+- Changed the auto-lock, wrong code attempts, and shutout timer lists to follow
+  the lock: a value it refuses is dropped, and one set at the lock is added
 
 ## v20260825 - 2026-08-25
 

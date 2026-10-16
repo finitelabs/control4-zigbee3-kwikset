@@ -192,6 +192,13 @@ driver's Properties tab:
 > sleepy battery device) acknowledges a change, the driver reports _Applying
 > lock changes..._; on first join the driver adopts the lock's current settings
 > rather than overwriting them.
+>
+> Only the settings the lock reports are shown; a SmartCode 10 Touchscreen, for
+> example, has no One Touch Locking setting. A value the lock refuses is
+> reported as _Not supported by this device_ in the lock's last action and
+> history and is not sent to the lock again; Auto Lock, Wrong Code Attempts, and
+> Shutout Timer drop it from their lists, and add a value set at the lock
+> itself. A firmware update on the lock offers every value again.
 
 ### Driver Actions
 
@@ -295,11 +302,18 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Fixed date-range user schedules starting and ending hours late by the
   controller's offset from UTC (5 hours in US Central summer time): the dates
   and times now go to the lock in its own local time
+- Fixed lock settings the lock does not have, such as one-touch locking on the
+  SmartCode 10 Touchscreen, being shown as on and sent to the lock: only the
+  settings the lock reports are offered, and a value it refuses now reads "Not
+  supported by this device" and is not sent again (keypad volume low used to be
+  turned into high)
 
 ### Changed
 
 - Changed the lock's real-time binding to go through the controller's Zigbee
   API, so keypad, thumbturn, and one-touch operations show as they happen
+- Changed the auto-lock, wrong code attempts, and shutout timer lists to follow
+  the lock: a value it refuses is dropped, and one set at the lock is added
 
 ## v20260825 - 2026-08-25
 
