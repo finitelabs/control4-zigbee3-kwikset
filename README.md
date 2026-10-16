@@ -298,7 +298,7 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Fixed user codes on a lock that numbers its users from 0, such as the
   SmartCode 10 Touchscreen: the driver now learns the lock's user numbers from
   the lock, so every one of its codes can be used and none is sent to a number
-  the lock refuses; codes already saved keep their place
+  the lock refuses
 - Fixed date-range user schedules starting and ending hours late by the
   controller's offset from UTC (5 hours in US Central summer time): the dates
   and times now go to the lock in its own local time
