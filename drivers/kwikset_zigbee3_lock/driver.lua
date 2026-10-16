@@ -213,7 +213,10 @@ local state = {
   supportsUserCodes = false,
   -- Whether a definitive keypad verdict has been received; gates the probe retry.
   keypadKnown = false,
-  users = {}, -- id -> { name, code, active, sched } (persisted)
+  users = {}, -- id -> { name, code, active, sched, slot } (persisted); slot is the user's id on the lock
+  -- The lock's user ids, { first, last }, once its answers to the edge probe
+  -- settle them (persisted); nil until then.
+  userIds = nil,
   history = {}, -- array of { date, time, message, source }, newest last (persisted)
   pending = {}, -- owed lock writes: key -> { kind, id, msg, group, attempts, ts } (persisted)
   pendingSeq = {}, -- ZCL seq -> pending key (transient; rebuilt as sends go out)
@@ -445,6 +448,17 @@ local function notifySettings()
   notify("SETTINGS", XMLTag("lock_settings", body, nil, false))
 end
 
+--- The lock's user ids: what its answers to the edge probe settled, else 1 to
+--- N-1, which a lock numbering from 0 and one numbering from 1 both allow.
+--- @return integer first
+--- @return integer last
+local function userIdRange()
+  if state.userIds then
+    return state.userIds.first, state.userIds.last
+  end
+  return 1, state.limits.maxUsers - 1
+end
+
 --- Push the capability set that matches state.supportsUserCodes to the proxy.
 --- Called on init to assert the persisted verdict (correcting any stale value the
 --- proxy kept across a driver update) and whenever the verdict changes.
@@ -454,9 +468,10 @@ local function applyUserCodeCapabilities()
   for _, name in ipairs(USER_CODE_CAPABILITIES) do
     notify("CAPABILITY_CHANGED", { NAME = name, VALUE = value })
   end
+  local first, last = userIdRange()
   notify("CAPABILITY_CHANGED", {
     NAME = "max_users",
-    VALUE = tostring(state.supportsUserCodes and state.limits.maxUsers or 0),
+    VALUE = tostring(state.supportsUserCodes and last - first + 1 or 0),
   })
   notify("LOCK_CAPABILITIES_CHANGED", {})
 end
@@ -676,6 +691,8 @@ local function loadState()
     state.dstEndpointLearned = true
   end
   state.users = persist:get("users", {}, true) or {}
+  local userIds = persist:get("userIds", nil)
+  state.userIds = type(userIds) == "table" and userIds or nil
   -- Lock-side settings: absent means "never configured" (adopt from the lock).
   -- Every load type-checks its value, so one stored as another type also
   -- reads as never configured.
@@ -1095,6 +1112,23 @@ local OP_EVENT_SOURCE = {
   [0xFF] = "Indeterminate",
 }
 
+--- The user an operation names by its user id on the lock: the stored user at
+--- that slot, else "User <id>" for one of the lock's ids; nil for none (0xFFFF).
+--- @param uid integer
+--- @return string|nil
+local function operationUser(uid)
+  for id, u in pairs(state.users) do
+    if u.slot == uid then
+      return u.name or ("User " .. id)
+    end
+  end
+  local first, last = userIdRange()
+  if uid >= first and uid <= last then
+    return "User " .. uid
+  end
+  return nil
+end
+
 --- Attribute an operation, from an operation event (cmd 0x20) or an event-log
 --- record (cmd 0x04): derive the source, user, and manual flag from the ZCL
 --- event code, source byte, and user id, then apply. RF right after our own
@@ -1102,7 +1136,7 @@ local OP_EVENT_SOURCE = {
 --- @param st string resolved STATUS_* value
 --- @param code integer ZCL OperationEvent code
 --- @param src integer ZCL OperationEventSource byte
---- @param uid integer user id (0xFFFF or 0 = none)
+--- @param uid integer user id on the lock (0xFFFF = none)
 local function attributeOperation(st, code, src, uid)
   local rf = src == 0x01
   local ours = rf and (os.time() - (state.cmdSentAt or 0)) <= CMD_ORIGIN_SECS
@@ -1111,26 +1145,27 @@ local function attributeOperation(st, code, src, uid)
   -- one, otherwise the manner; the manner is always kept in the description.
   local who = manner
   local desc = STATUS_LABEL[st] or st
-  if uid ~= 0xFFFF and uid ~= 0 then
-    local u = state.users[uid]
-    who = (u and u.name) or ("User " .. uid)
+  local user = operationUser(uid)
+  if user then
+    who = user
     desc = desc .. " by " .. who
   end
   desc = desc .. " (" .. manner .. ")"
   applyLockStatus(st, desc, who, not rf)
 end
 
---- Set or clear a user's PIN on the lock, per ZCL DoorLock. The send is tied to
---- its owed-write entry so the lock's response settles it.
+--- Set or clear a user's PIN on the lock, per ZCL DoorLock, at the user's slot.
+--- The send is tied to its owed-write entry so the lock's response settles it.
 local function writeUserPin(id, code)
   log:trace("writeUserPin(%s)", id)
+  local slot = state.users[id].slot
   local seq
   if code and #code >= 4 then
     -- status Occupied (1), type Unrestricted (0)
-    local payload = u16le(id) .. string.char(1) .. string.char(0) .. octstr(code)
+    local payload = u16le(slot) .. string.char(1) .. string.char(0) .. octstr(code)
     seq = sendCommand(CLUSTER_DOORLOCK, DL_SET_PIN, payload)
   else
-    seq = sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(id))
+    seq = sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(slot))
   end
   markPendingSent("pin:" .. id, seq)
 end
@@ -1139,16 +1174,20 @@ end
 -- weekday DaysMask has bit0=Sunday .. bit6=Saturday.
 local WEEKDAY_BITS = { 1, 2, 4, 8, 16, 32, 64 }
 
---- Push a user's schedule to the lock (ZCL DoorLock). A restricted user gets a
---- weekday or yearday schedule; an unrestricted user has both cleared. The lock
---- derives the user type from the schedule itself and enforces the window on
---- its own keypad. Each branch's final command settles the owed write.
+--- Push a user's schedule to the lock (ZCL DoorLock) at the user's slot. A
+--- restricted user gets a weekday or yearday schedule; an unrestricted user has
+--- both cleared. The lock derives the user type from the schedule itself and
+--- enforces the window on its own keypad. Each branch's final command settles
+--- the owed write.
 local function writeUserSchedule(id, u)
   log:trace("writeUserSchedule(%s)", id)
   local s = u.sched or {}
   if not s.restricted then
-    sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_WEEKDAY_SCHED, string.char(0) .. u16le(id))
-    markPendingSent("sched:" .. id, sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_YEARDAY_SCHED, string.char(0) .. u16le(id)))
+    sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_WEEKDAY_SCHED, string.char(0) .. u16le(u.slot))
+    markPendingSent(
+      "sched:" .. id,
+      sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_YEARDAY_SCHED, string.char(0) .. u16le(u.slot))
+    )
     return
   end
   if s.type == "date_range" then
@@ -1170,7 +1209,11 @@ local function writeUserSchedule(id, u)
     }) - ZCL_EPOCH_OFFSET
     markPendingSent(
       "sched:" .. id,
-      sendCommand(CLUSTER_DOORLOCK, DL_SET_YEARDAY_SCHED, string.char(0) .. u16le(id) .. u32le(startT) .. u32le(endT))
+      sendCommand(
+        CLUSTER_DOORLOCK,
+        DL_SET_YEARDAY_SCHED,
+        string.char(0) .. u16le(u.slot) .. u32le(startT) .. u32le(endT)
+      )
     )
   else
     local days, idx = 0, 1
@@ -1182,7 +1225,7 @@ local function writeUserSchedule(id, u)
     end
     local st, et = s.startTime or 0, s.endTime or 1439
     local payload = string.char(0)
-      .. u16le(id)
+      .. u16le(u.slot)
       .. string.char(days, math.floor(st / 60), st % 60, math.floor(et / 60), et % 60)
     markPendingSent("sched:" .. id, sendCommand(CLUSTER_DOORLOCK, DL_SET_WEEKDAY_SCHED, payload))
   end
@@ -1413,9 +1456,62 @@ stopCapProbe = function()
   CancelTimer(TIMER_CAP_PROBE)
 end
 
+-- Edge probe of the lock's user ids. ZCL allows 0 to N-1 or 1 to N for N PIN
+-- users, so Get PIN goes to ids 0 and N and the lock's answers settle which.
+local idProbe -- { n, seqs = { [seq] = id }, answers = { [id] = answered } } (transient)
+
+--- Ask the lock for ids 0 and N, each until it answers.
+--- @param n integer NumberOfPINUsersSupported
+local function probeUserIds(n)
+  if n < 1 then
+    return
+  end
+  if not idProbe or idProbe.n ~= n then
+    idProbe = { n = n, seqs = {}, answers = {} }
+  end
+  for _, id in ipairs({ 0, n }) do
+    if idProbe.answers[id] == nil then
+      idProbe.seqs[sendCommand(CLUSTER_DOORLOCK, DL_GET_PIN, u16le(id))] = id
+    end
+  end
+end
+
+--- Take the lock's answer to a probed id: a Get PIN response (answered) or an
+--- error status (refused). Both edges in, the ids are 0 to N-1 if only 0 was
+--- answered, 1 to N if only N was, and unsettled otherwise.
+--- @param id integer|nil
+--- @param answered boolean
+local function noteUserIdAnswer(id, answered)
+  local p = idProbe
+  if not p or (id ~= 0 and id ~= p.n) or p.answers[id] ~= nil then
+    return
+  end
+  p.answers[id] = answered
+  local zero, top = p.answers[0], p.answers[p.n]
+  if zero == nil or top == nil then
+    return
+  end
+  local ids
+  if zero and not top then
+    ids = { first = 0, last = p.n - 1 }
+  elseif top and not zero then
+    ids = { first = 1, last = p.n }
+  end
+  local old = state.userIds
+  if (old and old.first) == (ids and ids.first) and (old and old.last) == (ids and ids.last) then
+    return
+  end
+  state.userIds = ids
+  persist:set("userIds", ids)
+  local first, last = userIdRange()
+  log:info("Lock user ids are %d to %d%s", first, last, ids and "" or " (unsettled by the lock's answers)")
+  applyUserCodeCapabilities()
+end
+
 --- Probe now, then retry on a bounded timer until the verdicts resolve. Run on
 --- every online transition, so a module swap is re-probed too.
 local function startCapProbe()
+  idProbe = nil
   probeCapabilities()
   capProbeTries = 0
   if capsResolved() then
@@ -1459,6 +1555,28 @@ resendPendingEntry = function(key, e)
   end
 end
 
+--- The lowest of the lock's user ids that no stored user holds and no owed clear
+--- is still emptying; nil when the lock is full.
+--- @return integer|nil
+local function freeSlot()
+  local taken = {}
+  for _, u in pairs(state.users) do
+    taken[u.slot] = true
+  end
+  for _, e in pairs(state.pending) do
+    if e.kind == "clear" then
+      taken[e.id] = true
+    end
+  end
+  local first, last = userIdRange()
+  for slot = first, last do
+    if not taken[slot] then
+      return slot
+    end
+  end
+  return nil
+end
+
 --- Add or edit a user code. tParams carries USER_ID/USER_NAME/PASSCODE/IS_ACTIVE
 --- and optional schedule fields. The lock proxy has no reject-with-message path,
 --- so when a save would trip a lock limit we refuse it and surface the reason in
@@ -1474,20 +1592,23 @@ local function upsertUser(tParams, isEdit)
   end
   local id = tointeger(Select(tParams, "USER_ID"))
   if id == nil then
-    for i = 1, state.limits.maxUsers do
-      if state.users[i] == nil then
-        id = i
-        break
-      end
+    id = 1
+    while state.users[id] ~= nil do
+      id = id + 1
     end
   end
-  if id == nil or id > state.limits.maxUsers then
-    log:warn("No free user slot (max %d)", state.limits.maxUsers)
-    notifyLockChanged(
-      string.format("Cannot add user: lock supports %d codes", state.limits.maxUsers),
-      "Control4",
-      false
-    )
+  -- A stored user keeps its slot; a new one takes the lowest free of the lock's ids.
+  local prev = state.users[id]
+  local slot
+  if prev then
+    slot = prev.slot
+  else
+    slot = freeSlot()
+  end
+  if slot == nil then
+    local first, last = userIdRange()
+    log:warn("No free user slot (lock ids %d to %d)", first, last)
+    notifyLockChanged(string.format("Cannot add user: lock supports %d codes", last - first + 1), "Control4", false)
     return
   end
   local code = Select(tParams, "PASSCODE")
@@ -1503,10 +1624,10 @@ local function upsertUser(tParams, isEdit)
       return
     end
   end
-  local prev = state.users[id]
   local prevCode = prev and prev.code or nil
   local prevActive = prev and toboolean(prev.active)
   local u = prev or {}
+  u.slot = slot
   u.name = Select(tParams, "USER_NAME") or u.name or ("User " .. id)
   if not IsEmpty(code) then
     u.code = tostring(code)
@@ -1630,16 +1751,17 @@ function RFP.DELETE_USER(idBinding, strCommand, tParams)
   if id == nil or state.users[id] == nil then
     return
   end
-  local name = state.users[id].name
+  local name, slot = state.users[id].name, state.users[id].slot
   state.users[id] = nil
   saveUsers()
   -- Any owed writes for the user are superseded by the revocation; the clear
   -- itself stays owed until the lock confirms it (a missed clear would leave a
-  -- revoked PIN working while the UI says it is gone).
+  -- revoked PIN working while the UI says it is gone). It is keyed by the slot,
+  -- which stays taken until then.
   cancelPending("pin:" .. id)
   cancelPending("sched:" .. id)
-  registerPending("clear:" .. id, "clear", id, string.format("Deleted User %d (%s)", id, name or ""), nil)
-  markPendingSent("clear:" .. id, sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(id)))
+  registerPending("clear:" .. slot, "clear", slot, string.format("Deleted User %d (%s)", id, name or ""), nil)
+  markPendingSent("clear:" .. slot, sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(slot)))
   notify("USER_DELETED", { USER_ID = id, USER_NAME = name })
 end
 
@@ -1826,7 +1948,7 @@ function EC.Sync_Users(tParams)
     registerPending("pin:" .. id, "pin", id, nil, nil)
     registerPending("sched:" .. id, "sched", id, nil, nil)
     if u.active and u.code then
-      sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(id))
+      sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(u.slot))
     end
     writeUserPin(id, u.active and u.code or nil)
     writeUserSchedule(id, u)
@@ -1930,6 +2052,7 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         -- Capability limits reported by the lock; use them for validation.
         if attrs[ATTR_NUM_PIN_USERS] and attrs[ATTR_NUM_PIN_USERS].value then
           state.limits.maxUsers = attrs[ATTR_NUM_PIN_USERS].value
+          probeUserIds(state.limits.maxUsers)
         end
         if attrs[ATTR_MIN_PIN_LEN] and attrs[ATTR_MIN_PIN_LEN].value then
           state.limits.minPin = attrs[ATTR_MIN_PIN_LEN].value
@@ -2010,6 +2133,9 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         -- The lock understood GetPINCode, so it has a keypad. Restore user
         -- management in case this driver was moved onto a keypad lock.
         setUserCodeSupport(true)
+        if #payload >= 2 then
+          noteUserIdAnswer(payload:byte(1) + payload:byte(2) * 256, true)
+        end
       elseif clusterSpecific and DL_RESPONSE_CMDS[cmd] and #payload >= 1 then
         -- Set/Clear PIN, schedule, and user-type responses echo our sequence
         -- with a status byte - they settle the matching owed write.
@@ -2021,6 +2147,11 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         if status == ZCL_STATUS_UNSUP_CMD and CREDENTIAL_CMDS[respCmd] then
           setUserCodeSupport(false)
           cancelCredentialPending()
+        elseif respCmd == DL_GET_PIN then
+          -- An id outside the lock's range is refused with an error (0x85 on a 916).
+          if status ~= 0 and idProbe then
+            noteUserIdAnswer(idProbe.seqs[seq], false)
+          end
         else
           -- Some stacks ack global writes with a Default Response.
           confirmSeq(seq, status)

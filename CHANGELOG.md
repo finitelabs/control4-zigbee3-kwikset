@@ -25,6 +25,10 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Fixed one-touch locking that had been turned off showing as on after a driver
   update or controller reboot, where a change the lock had not yet confirmed
   could be sent to it as on; the setting now loads as it was saved
+- Fixed user codes on a lock that numbers its users from 0, such as the
+  SmartCode 10 Touchscreen: the driver now learns the lock's user numbers from
+  the lock, so every one of its codes can be used and none is sent to a number
+  the lock refuses; codes already saved keep their place
 
 ### Changed
 

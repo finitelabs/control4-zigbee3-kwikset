@@ -55,6 +55,9 @@ local function save(users, tParams)
     writeUserSchedule = function() end,
     notify = function() end,
     userFields = function() end,
+    freeSlot = function()
+      return 3
+    end,
   }
   env.registerPending = function(key)
     env.owed[key] = true
@@ -69,32 +72,32 @@ end
 
 T.section("an edit that changes neither the code nor the active state owes no PIN write")
 local env = save(
-  { [3] = { name = "Guest", code = "1234", active = false } },
+  { [3] = { name = "Guest", code = "1234", active = false, slot = 3 } },
   { USER_ID = "3", USER_NAME = "Cleaner", PASSCODE = "1234", IS_ACTIVE = "False" }
 )
 T.eq("an inactive user renamed", env.pinWrites, {})
 T.eq("its PIN is not owed", env.owed["pin:3"], nil)
 T.eq("its schedule still is", env.owed["sched:3"], true)
 env = save(
-  { [3] = { name = "Guest", code = "1234", active = true } },
+  { [3] = { name = "Guest", code = "1234", active = true, slot = 3 } },
   { USER_ID = "3", USER_NAME = "Cleaner", PASSCODE = "1234", IS_ACTIVE = "True" }
 )
 T.eq("an active user renamed", env.pinWrites, {})
 
 T.section("a changed active state or code owes one")
 env = save(
-  { [3] = { name = "Guest", code = "1234", active = true } },
+  { [3] = { name = "Guest", code = "1234", active = true, slot = 3 } },
   { USER_ID = "3", USER_NAME = "Guest", PASSCODE = "1234", IS_ACTIVE = "False" }
 )
 T.eq("a user made inactive has its PIN cleared", env.pinWrites, { { id = 3 } })
 T.eq("and the clear is owed", env.owed["pin:3"], true)
 env = save(
-  { [3] = { name = "Guest", code = "1234", active = false } },
+  { [3] = { name = "Guest", code = "1234", active = false, slot = 3 } },
   { USER_ID = "3", USER_NAME = "Guest", PASSCODE = "1234", IS_ACTIVE = "True" }
 )
 T.eq("a user made active has its PIN set", env.pinWrites, { { id = 3, code = "1234" } })
 env = save(
-  { [3] = { name = "Guest", code = "1234", active = true } },
+  { [3] = { name = "Guest", code = "1234", active = true, slot = 3 } },
   { USER_ID = "3", USER_NAME = "Guest", PASSCODE = "5678", IS_ACTIVE = "True" }
 )
 T.eq("an active user given a new code has it set", env.pinWrites, { { id = 3, code = "5678" } })
