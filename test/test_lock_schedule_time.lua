@@ -39,10 +39,9 @@ local function window(f)
   return { u32(4), u32(8) }
 end
 
---------------------------------------------------------------------------------
-T.section("a date range goes to the lock as its own wall-clock time")
---------------------------------------------------------------------------------
-do
+--- Save user 1 with a date range from `from` to `to`, each { year, month, day,
+--- minute of the day }, and return the year-day schedules it sent.
+local function dateRange(from, to)
   local seed = { users = { [1] = { name = "Derek", code = "1234", active = true, slot = 1 } } }
   for k, v in pairs(F.KEYPAD) do
     seed[k] = v
@@ -56,20 +55,37 @@ do
     IS_ACTIVE = "true",
     IS_RESTRICTED_SCHEDULE = "true",
     SCHEDULE_TYPE = "date_range",
-    START_YEAR = "2026",
-    START_MONTH = "10",
-    START_DAY = "16",
-    START_TIME = tostring(12 * 60 + 50),
-    END_YEAR = "2026",
-    END_MONTH = "12",
-    END_DAY = "25",
-    END_TIME = tostring(8 * 60),
+    START_YEAR = tostring(from[1]),
+    START_MONTH = tostring(from[2]),
+    START_DAY = tostring(from[3]),
+    START_TIME = tostring(from[4]),
+    END_YEAR = tostring(to[1]),
+    END_MONTH = tostring(to[2]),
+    END_DAY = tostring(to[3]),
+    END_TIME = tostring(to[4]),
   })
-  local sets = F.only(F.sent(), F.SET_YEARDAY)
+  return F.only(F.sent(), F.SET_YEARDAY)
+end
+
+--------------------------------------------------------------------------------
+T.section("a date range goes to the lock as its own wall-clock time")
+--------------------------------------------------------------------------------
+do
+  local sets = dateRange({ 2026, 10, 16, 12 * 60 + 50 }, { 2026, 12, 25, 8 * 60 })
   T.eq("one year-day schedule is sent, for user 1", #sets == 1 and F.userId(sets[1]), 1)
   local got = sets[1] and window(sets[1]) or {}
   T.eq("12:50 on 2026-10-16 (CDT) starts at the lock's own 12:50", got[1], 845470200)
   T.eq("08:00 on 2026-12-25 (CST) ends at the lock's own 08:00", got[2], 851500800)
+end
+
+--------------------------------------------------------------------------------
+T.section("a date range in January and February counts from the right year")
+--------------------------------------------------------------------------------
+do
+  local sets = dateRange({ 2028, 1, 15, 9 * 60 }, { 2028, 2, 29, 17 * 60 + 30 })
+  local got = sets[1] and window(sets[1]) or {}
+  T.eq("09:00 on 2028-01-15", got[1], 884854800)
+  T.eq("17:30 on 2028-02-29, a leap day", got[2], 888773400)
 end
 
 T.finish()

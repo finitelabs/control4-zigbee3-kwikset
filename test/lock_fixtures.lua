@@ -36,7 +36,10 @@ F.DEFAULT_RSP = 0x0b
 F.SET_PIN = 0x05
 F.GET_PIN = 0x06
 F.CLEAR_PIN = 0x07
+F.SET_WEEKDAY = 0x0b
+F.CLEAR_WEEKDAY = 0x0d
 F.SET_YEARDAY = 0x0e
+F.CLEAR_YEARDAY = 0x10
 F.OPER_EVENT = 0x20
 
 -- A keypad lock on its endpoint 2, as a joined Kwikset is stored.
@@ -168,10 +171,14 @@ function F.only(frames, cmd, specific)
   return out
 end
 
+-- Schedule commands, whose user id follows a schedule id.
+local SCHEDULE_CMDS =
+  { [F.SET_WEEKDAY] = true, [F.CLEAR_WEEKDAY] = true, [F.SET_YEARDAY] = true, [F.CLEAR_YEARDAY] = true }
+
 --- The user id a PIN or schedule command names (its first u16; a schedule's after its id).
 --- @param f table A frame from F.sent().
 function F.userId(f)
-  local at = (f.cmd == F.SET_YEARDAY or f.cmd == 0x0b or f.cmd == 0x0d or f.cmd == 0x10) and 2 or 1
+  local at = SCHEDULE_CMDS[f.cmd] and 2 or 1
   return f.payload:byte(at) + f.payload:byte(at + 1) * 256
 end
 

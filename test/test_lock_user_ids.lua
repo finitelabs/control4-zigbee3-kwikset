@@ -245,6 +245,60 @@ do
 end
 
 --------------------------------------------------------------------------------
+T.section("a user whose id on the lock is not its Control4 id is written at its slot")
+--------------------------------------------------------------------------------
+do
+  -- Front Porch after the update: Control4's user 2 went to the lock's id 0.
+  local seed = store({ [2] = { name = "Guest", code = "5678", active = true, slot = 0 } })
+  seed.userIds = { first = 0, last = 29 }
+  F.start(seed)
+  F.sent()
+  local function edit(params)
+    local p = { USER_ID = "2", USER_NAME = "Guest", PASSCODE = "5678", IS_ACTIVE = "true" }
+    for k, v in pairs(params) do
+      p[k] = v
+    end
+    F.proxy("EDIT_USER", p)
+    return F.sent()
+  end
+
+  local sent = edit({
+    IS_RESTRICTED_SCHEDULE = "true",
+    SCHEDULE_TYPE = "daily",
+    SCHEDULED_DAYS = "false,true,true,true,true,true,false",
+    START_TIME = "480",
+    END_TIME = "1020",
+  })
+  T.eq("a week-day schedule goes to id 0", named(sent, F.SET_WEEKDAY), { 0 })
+  sent = edit({
+    IS_RESTRICTED_SCHEDULE = "true",
+    SCHEDULE_TYPE = "date_range",
+    START_YEAR = "2026",
+    START_MONTH = "11",
+    START_DAY = "1",
+    END_YEAR = "2026",
+    END_MONTH = "11",
+    END_DAY = "8",
+  })
+  T.eq("a year-day schedule goes to id 0", named(sent, F.SET_YEARDAY), { 0 })
+  sent = edit({ IS_RESTRICTED_SCHEDULE = "false" })
+  T.eq("a schedule's week-day clear goes to id 0", named(sent, F.CLEAR_WEEKDAY), { 0 })
+  T.eq("and its year-day clear", named(sent, F.CLEAR_YEARDAY), { 0 })
+  sent = edit({ IS_ACTIVE = "false" })
+  T.eq("an inactive user's PIN clear goes to id 0", named(sent, F.CLEAR_PIN), { 0 })
+  sent = edit({})
+  T.eq("its PIN goes to id 0 when it is active again", named(sent, F.SET_PIN), { 0 })
+
+  EC.Sync_Users({})
+  sent = F.sent()
+  T.eq("Sync Users clears id 0 before writing it", named(sent, F.CLEAR_PIN), { 0 })
+  T.eq("and writes its PIN to id 0", named(sent, F.SET_PIN), { 0 })
+
+  F.proxy("DELETE_USER", { USER_ID = "2" })
+  T.eq("the delete clears id 0", named(F.sent(), F.CLEAR_PIN), { 0 })
+end
+
+--------------------------------------------------------------------------------
 T.section("only a keypad or RFID operation names a user, whatever id the lock reports")
 --------------------------------------------------------------------------------
 do
@@ -316,6 +370,24 @@ do
 
   answer(resolved(FRONT_PORCH), true, false)
   T.eq("both answered at once, the probe stops", Timer.CapProbe, nil)
+end
+
+--------------------------------------------------------------------------------
+T.section("each online asks the lock again")
+--------------------------------------------------------------------------------
+do
+  answer(online(FRONT_PORCH), true, false)
+  OnZigbeeOnlineStatusChanged("OFFLINE", "", "")
+  OnZigbeeOnlineStatusChanged("ONLINE", "", "")
+  F.sent()
+  F.readResponse({ F.attr(0x0012, 0x21, 30) })
+  local seqs = {}
+  for _, f in ipairs(F.only(F.sent(), F.GET_PIN)) do
+    seqs[F.userId(f)] = f.seq
+  end
+  T.check("ids 0 and 30 are asked again", seqs[0] ~= nil and seqs[30] ~= nil, T.show(seqs))
+  answer(seqs, false, true)
+  T.eq("and a lock now numbering from 1 is taken at its word", F.stored("userIds"), { first = 1, last = 30 })
 end
 
 T.finish()

@@ -182,6 +182,22 @@ do
 end
 
 --------------------------------------------------------------------------------
+T.section("a refusal of a write a newer one replaced is left to that one's answer")
+--------------------------------------------------------------------------------
+do
+  online(FRONT_PORCH)
+  local low = set("SET_VOLUME", { VOLUME = "low" })
+  local silent = set("SET_VOLUME", { VOLUME = "silent" })
+  F.told()
+  writeResponse(low[1] and low[1].seq or 0xEE, INVALID_VALUE, 0x0024)
+  T.eq("the stale refusal is not shown", F.last(F.told(), "LOCK_STATUS_CHANGED"), nil)
+  T.eq("nothing is kept as refused", (F.stored("settingRefused") or { values = {} }).values["attr:volume"], nil)
+  T.truthy("silent is still owed", (F.stored("pendingWrites") or {})["attr:volume"])
+  writeResponse(silent[1] and silent[1].seq or 0xEE, 0)
+  T.eq("until the lock takes it", F.stored("pendingWrites"), {})
+end
+
+--------------------------------------------------------------------------------
 T.section("the auto-lock list follows what the lock takes and holds")
 --------------------------------------------------------------------------------
 do
