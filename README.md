@@ -192,6 +192,13 @@ driver's Properties tab:
 > sleepy battery device) acknowledges a change, the driver reports _Applying
 > lock changes..._; on first join the driver adopts the lock's current settings
 > rather than overwriting them.
+>
+> Only the settings the lock reports are shown; a SmartCode 10 Touchscreen, for
+> example, has no One Touch Locking setting. A value the lock refuses is
+> reported as _Not supported by this device_ in the lock's last action and
+> history and is not sent to the lock again; Auto Lock, Wrong Code Attempts, and
+> Shutout Timer drop it from their lists, and add a value set at the lock
+> itself. A firmware update on the lock offers every value again.
 
 ### Driver Actions
 
@@ -209,8 +216,9 @@ Locks the lock if it is unlocked, and unlocks it if it is locked.
 
 #### Sync Users
 
-Re-sends every stored user code and schedule to the lock. Use this if the lock
-was reset or you suspect its codes are out of sync with the project.
+Re-sends every stored user code and schedule to the lock, and any user deletion
+the lock has not confirmed. Use this if the lock was reset or you suspect its
+codes are out of sync with the project.
 
 #### Get Battery Status
 
@@ -288,11 +296,32 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Fixed one-touch locking that had been turned off showing as on after a driver
   update or controller reboot, where a change the lock had not yet confirmed
   could be sent to it as on; the setting now loads as it was saved
+- Fixed user codes on a lock that numbers its users from 0, such as the
+  SmartCode 10 Touchscreen: the driver now learns the lock's user numbers from
+  the lock, so every one of its codes can be used and none is sent to a number
+  the lock refuses
+- Fixed a lock or unlock from Control4 or the thumbturn being credited to a user
+  when the lock reports a user number with it: only a keypad or RFID operation
+  now names a user
+- Fixed a deleted user's number on the lock going to a new user before the lock
+  confirmed the delete, while the old code could still open the door: the number
+  stays taken until the lock confirms it, and Sync Users sends a delete the lock
+  did not take again
+- Fixed date-range user schedules starting and ending hours late by the
+  controller's offset from UTC (5 hours in US Central summer time): the dates
+  and times now go to the lock in its own local time
+- Fixed lock settings the lock does not have, such as one-touch locking on the
+  SmartCode 10 Touchscreen, being shown as on and sent to the lock: only the
+  settings the lock reports are offered, and a value it refuses now reads "Not
+  supported by this device" and is not sent again (keypad volume low used to be
+  turned into high)
 
 ### Changed
 
 - Changed the lock's real-time binding to go through the controller's Zigbee
   API, so keypad, thumbturn, and one-touch operations show as they happen
+- Changed the auto-lock, wrong code attempts, and shutout timer lists to follow
+  the lock: a value it refuses is dropped, and one set at the lock is added
 
 ## v20260825 - 2026-08-25
 

@@ -58,6 +58,7 @@ local ZCL_REPORT_ATTR = 0x0a
 local ZCL_DEFAULT_RESPONSE = 0x0b -- <cmdId:u8> <status:u8>
 local ZCL_STATUS_UNSUP_CMD = 0x81 -- UNSUP_CLUSTER_COMMAND
 local ZCL_STATUS_UNSUP_ATTR = 0x86 -- UNSUPPORTED_ATTRIBUTE
+local ZCL_STATUS_INVALID_VALUE = 0x87 -- INVALID_VALUE
 
 -- DoorLock cluster-specific command ids (client -> server)
 local DL_LOCK = 0x00 -- <pin:octstr>
@@ -113,9 +114,6 @@ local USER_CODE_CAPABILITIES = {
   "has_schedule_lockout",
   "has_admin_code",
 }
-
--- Seconds between the Unix epoch (1970) and the ZCL epoch (2000-01-01 UTC).
-local ZCL_EPOCH_OFFSET = 946684800
 
 -- DoorLock attributes
 local ATTR_LOCK_STATE = 0x0000 -- 0 not-fully / 1 locked / 2 unlocked
@@ -196,9 +194,8 @@ local state = {
   action = nil, -- last applied transition, for coalescing dual reports (ephemeral)
   logSupported = nil, -- true if the lock has an event log (attr 0x0010 > 0)
   lastLogEntryId = nil, -- newest event-log id already attributed, to skip repeats
-  -- Lock-side config settings. nil = never configured here: the first value the
-  -- lock reports is adopted as desired; once set from Control4, desired wins
-  -- and drift on the lock is re-asserted.
+  -- Lock-side config settings, nil until the lock reports a value. The lock's
+  -- value is adopted; a Control4 change goes to the lock as an owed write.
   autoLockSeconds = nil,
   volume = nil, -- "silent" | "low" | "high"
   oneTouchLocking = nil,
@@ -213,15 +210,24 @@ local state = {
   supportsUserCodes = false,
   -- Whether a definitive keypad verdict has been received; gates the probe retry.
   keypadKnown = false,
-  users = {}, -- id -> { name, code, active, sched } (persisted)
+  users = {}, -- id -> { name, code, active, sched, slot } (persisted); slot is the user's id on the lock
+  -- The lock's user ids, { first, last }, once its answers to the edge probe
+  -- settle them (persisted); nil until then.
+  userIds = nil,
   history = {}, -- array of { date, time, message, source }, newest last (persisted)
   pending = {}, -- owed lock writes: key -> { kind, id, msg, group, attempts, ts } (persisted)
   pendingSeq = {}, -- ZCL seq -> pending key (transient; rebuilt as sends go out)
+  -- Deleted users' clears the lock refused or never confirmed, by owed-write key ->
+  -- { id = slot, msg }; the old code may still open the door (persisted).
+  uncleared = {},
   -- Per-setting support verdicts learned from the lock's per-attribute ZCL
   -- statuses; absent = assumed unsupported until the lock answers, matching the
   -- restrictive driver.xml defaults. false hides the setting via
   -- CAPABILITY_CHANGED. (persisted)
   settingSupport = {},
+  -- Setting values the lock refused, by setting key and ZCL value, and the
+  -- firmware build that refused them (persisted).
+  refused = { values = {} },
   -- Lock capability limits, read from the DoorLock cluster at online. Seeded
   -- with the SmartCode Convert's known values so validation works before the
   -- lock reports.
@@ -425,24 +431,15 @@ local function notifyBattery()
   end
 end
 
-local function notifySettings()
-  log:trace("notifySettings()")
-  local oneTouch = state.oneTouchLocking
-  if oneTouch == nil then
-    oneTouch = true
+--- The lock's user ids: what its answers to the edge probe settled, else 1 to
+--- N-1, which a lock numbering from 0 and one numbering from 1 both allow.
+--- @return integer first
+--- @return integer last
+local function userIdRange()
+  if state.userIds then
+    return state.userIds.first, state.userIds.last
   end
-  local body = XMLTag("admin_code", state.adminCode)
-    .. XMLTag("auto_lock_time", state.autoLockSeconds or 0)
-    .. XMLTag("log_item_count", state.logItemCount)
-    .. XMLTag("schedule_lockout_enabled", tostring(state.scheduleLockoutEnabled))
-    .. XMLTag("lock_mode", "normal")
-    .. XMLTag("log_failed_attempts", "false")
-    .. XMLTag("wrong_code_attempts", state.wrongCodeAttempts or 3)
-    .. XMLTag("shutout_timer", state.shutoutTimer or 60)
-    .. XMLTag("language", "English")
-    .. XMLTag("volume", state.volume or "high")
-    .. XMLTag("one_touch_locking", tostring(oneTouch))
-  notify("SETTINGS", XMLTag("lock_settings", body, nil, false))
+  return 1, state.limits.maxUsers - 1
 end
 
 --- Push the capability set that matches state.supportsUserCodes to the proxy.
@@ -454,9 +451,10 @@ local function applyUserCodeCapabilities()
   for _, name in ipairs(USER_CODE_CAPABILITIES) do
     notify("CAPABILITY_CHANGED", { NAME = name, VALUE = value })
   end
+  local first, last = userIdRange()
   notify("CAPABILITY_CHANGED", {
     NAME = "max_users",
-    VALUE = tostring(state.supportsUserCodes and state.limits.maxUsers or 0),
+    VALUE = tostring(state.supportsUserCodes and last - first + 1 or 0),
   })
   notify("LOCK_CAPABILITIES_CHANGED", {})
 end
@@ -676,6 +674,8 @@ local function loadState()
     state.dstEndpointLearned = true
   end
   state.users = persist:get("users", {}, true) or {}
+  local userIds = persist:get("userIds", nil)
+  state.userIds = type(userIds) == "table" and userIds or nil
   -- Lock-side settings: absent means "never configured" (adopt from the lock).
   -- Every load type-checks its value, so one stored as another type also
   -- reads as never configured.
@@ -696,7 +696,11 @@ local function loadState()
   -- Writes owed to the lock from a previous run; re-armed (not re-sent) in
   -- OnDriverLateInit and flushed when the lock next speaks.
   state.pending = persist:get("pendingWrites", {}) or {}
+  local uncleared = persist:get("unclearedSlots", nil)
+  state.uncleared = type(uncleared) == "table" and uncleared or {}
   state.settingSupport = persist:get("settingSupport", {}) or {}
+  local refused = persist:get("settingRefused", nil)
+  state.refused = type(refused) == "table" and type(refused.values) == "table" and refused or { values = {} }
   -- A stored value is the last verdict; unknown defaults to no keypad, so user
   -- management stays hidden until the lock proves it (restrictive default).
   state.supportsUserCodes = toboolean(persist:get("supportsUserCodes", false))
@@ -722,6 +726,7 @@ local PENDING_RESEND_HOLDOFF = 5 -- seconds; don't re-spam a write that just wen
 -- defined below, and the mutators need the timer.
 local resendPendingEntry
 local armPendingTimer
+local refuseSettingValue
 -- OnZigbeePacketIn hands the binder the endpoint the moment it learns it, above
 -- where the binder is made.
 local binder
@@ -794,6 +799,7 @@ local function markPendingSent(key, seq)
   local e = state.pending[key]
   if e then
     e.lastSent = os.time()
+    e.seq = seq
     state.pendingSeq[seq] = key
   end
 end
@@ -845,6 +851,11 @@ local function failPending(key, reason)
   end
   state.pending[key] = nil
   savePending()
+  if e.kind == "clear" then
+    -- Its slot is not reused while the old code may still open the door.
+    state.uncleared[key] = { id = e.id, msg = e.msg }
+    persist:set("unclearedSlots", state.uncleared)
+  end
   local what = e.msg or ("Lock write " .. key)
   addHistory(string.format("%s - %s", what, reason), "Control4")
   notifyLockChanged(string.format("%s - %s", what, reason), "Control4", false)
@@ -859,8 +870,12 @@ local function confirmSeq(seq, status)
     return
   end
   state.pendingSeq[seq] = nil
+  local e = state.pending[key]
   if status == 0 then
     confirmPending(key)
+  elseif e and e.kind == "attr" and status == ZCL_STATUS_INVALID_VALUE then
+    -- A setting the lock has, refusing the value (low volume on a 916).
+    refuseSettingValue(key, seq)
   else
     failPending(key, string.format("rejected by lock (status 0x%02x)", status))
   end
@@ -1095,14 +1110,31 @@ local OP_EVENT_SOURCE = {
   [0xFF] = "Indeterminate",
 }
 
+--- The user an operation names by its user id on the lock: the stored user at
+--- that slot, else "User <id>" for one of the lock's ids; nil for none (0xFFFF).
+--- @param uid integer
+--- @return string|nil
+local function operationUser(uid)
+  for id, u in pairs(state.users) do
+    if u.slot == uid then
+      return u.name or ("User " .. id)
+    end
+  end
+  local first, last = userIdRange()
+  if uid >= first and uid <= last then
+    return "User " .. uid
+  end
+  return nil
+end
+
 --- Attribute an operation, from an operation event (cmd 0x20) or an event-log
 --- record (cmd 0x04): derive the source, user, and manual flag from the ZCL
 --- event code, source byte, and user id, then apply. RF right after our own
---- command is the driver's doing.
+--- command is the driver's doing. Only a keypad or RFID operation names a user.
 --- @param st string resolved STATUS_* value
 --- @param code integer ZCL OperationEvent code
 --- @param src integer ZCL OperationEventSource byte
---- @param uid integer user id (0xFFFF or 0 = none)
+--- @param uid integer user id on the lock (0xFFFF = none)
 local function attributeOperation(st, code, src, uid)
   local rf = src == 0x01
   local ours = rf and (os.time() - (state.cmdSentAt or 0)) <= CMD_ORIGIN_SECS
@@ -1111,26 +1143,29 @@ local function attributeOperation(st, code, src, uid)
   -- one, otherwise the manner; the manner is always kept in the description.
   local who = manner
   local desc = STATUS_LABEL[st] or st
-  if uid ~= 0xFFFF and uid ~= 0 then
-    local u = state.users[uid]
-    who = (u and u.name) or ("User " .. uid)
+  -- A user's code is entered at the lock; Control4's RF lock and unlock carry the
+  -- admin code, so an RF or manual operation's user id names no user.
+  local user = (src == 0x00 or src == 0x03) and operationUser(uid) or nil
+  if user then
+    who = user
     desc = desc .. " by " .. who
   end
   desc = desc .. " (" .. manner .. ")"
   applyLockStatus(st, desc, who, not rf)
 end
 
---- Set or clear a user's PIN on the lock, per ZCL DoorLock. The send is tied to
---- its owed-write entry so the lock's response settles it.
+--- Set or clear a user's PIN on the lock, per ZCL DoorLock, at the user's slot.
+--- The send is tied to its owed-write entry so the lock's response settles it.
 local function writeUserPin(id, code)
   log:trace("writeUserPin(%s)", id)
+  local slot = state.users[id].slot
   local seq
   if code and #code >= 4 then
     -- status Occupied (1), type Unrestricted (0)
-    local payload = u16le(id) .. string.char(1) .. string.char(0) .. octstr(code)
+    local payload = u16le(slot) .. string.char(1) .. string.char(0) .. octstr(code)
     seq = sendCommand(CLUSTER_DOORLOCK, DL_SET_PIN, payload)
   else
-    seq = sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(id))
+    seq = sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(slot))
   end
   markPendingSent("pin:" .. id, seq)
 end
@@ -1139,38 +1174,50 @@ end
 -- weekday DaysMask has bit0=Sunday .. bit6=Saturday.
 local WEEKDAY_BITS = { 1, 2, 4, 8, 16, 32, 64 }
 
---- Push a user's schedule to the lock (ZCL DoorLock). A restricted user gets a
---- weekday or yearday schedule; an unrestricted user has both cleared. The lock
---- derives the user type from the schedule itself and enforces the window on
---- its own keypad. Each branch's final command settles the owed write.
+--- ZCL LocalTime for a date and a minute of that day: seconds since 2000-01-01
+--- 00:00 on the lock's clock, which keeps local wall-clock time (DST included),
+--- so it is counted on the calendar alone, with no time zone.
+--- @param year integer
+--- @param month integer
+--- @param day integer
+--- @param minutes integer Minutes from midnight.
+--- @return integer
+local function zclLocalTime(year, month, day, minutes)
+  -- Days from 1970-01-01 (Hinnant's days_from_civil), less the 10957 to 2000-01-01.
+  local y = month <= 2 and year - 1 or year
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local doy = math.floor((153 * ((month + 9) % 12) + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return (era * 146097 + doe - 719468 - 10957) * 86400 + minutes * 60
+end
+
+--- Push a user's schedule to the lock (ZCL DoorLock) at the user's slot. A
+--- restricted user gets a weekday or yearday schedule; an unrestricted user has
+--- both cleared. The lock derives the user type from the schedule itself and
+--- enforces the window on its own keypad. Each branch's final command settles
+--- the owed write.
 local function writeUserSchedule(id, u)
   log:trace("writeUserSchedule(%s)", id)
   local s = u.sched or {}
   if not s.restricted then
-    sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_WEEKDAY_SCHED, string.char(0) .. u16le(id))
-    markPendingSent("sched:" .. id, sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_YEARDAY_SCHED, string.char(0) .. u16le(id)))
+    sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_WEEKDAY_SCHED, string.char(0) .. u16le(u.slot))
+    markPendingSent(
+      "sched:" .. id,
+      sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_YEARDAY_SCHED, string.char(0) .. u16le(u.slot))
+    )
     return
   end
   if s.type == "date_range" then
-    local startT = os.time({
-      year = s.startYear or 2000,
-      month = s.startMonth or 1,
-      day = s.startDay or 1,
-      hour = math.floor((s.startTime or 0) / 60),
-      min = (s.startTime or 0) % 60,
-      sec = 0,
-    }) - ZCL_EPOCH_OFFSET
-    local endT = os.time({
-      year = s.endYear or 2000,
-      month = s.endMonth or 1,
-      day = s.endDay or 1,
-      hour = math.floor((s.endTime or 0) / 60),
-      min = (s.endTime or 0) % 60,
-      sec = 0,
-    }) - ZCL_EPOCH_OFFSET
+    local startT = zclLocalTime(s.startYear or 2000, s.startMonth or 1, s.startDay or 1, s.startTime or 0)
+    local endT = zclLocalTime(s.endYear or 2000, s.endMonth or 1, s.endDay or 1, s.endTime or 0)
     markPendingSent(
       "sched:" .. id,
-      sendCommand(CLUSTER_DOORLOCK, DL_SET_YEARDAY_SCHED, string.char(0) .. u16le(id) .. u32le(startT) .. u32le(endT))
+      sendCommand(
+        CLUSTER_DOORLOCK,
+        DL_SET_YEARDAY_SCHED,
+        string.char(0) .. u16le(u.slot) .. u32le(startT) .. u32le(endT)
+      )
     )
   else
     local days, idx = 0, 1
@@ -1182,68 +1229,80 @@ local function writeUserSchedule(id, u)
     end
     local st, et = s.startTime or 0, s.endTime or 1439
     local payload = string.char(0)
-      .. u16le(id)
+      .. u16le(u.slot)
       .. string.char(days, math.floor(st / 60), st % 60, math.floor(et / 60), et % 60)
     markPendingSent("sched:" .. id, sendCommand(CLUSTER_DOORLOCK, DL_SET_WEEKDAY_SCHED, payload))
   end
 end
 
+--- Seconds as the proxy's auto-lock and shutout lists show them.
+--- @param v integer
+local function secondsText(v)
+  if v >= 60 and v % 60 == 0 then
+    return string.format("%d min", v / 60)
+  end
+  return string.format("%d sec", v)
+end
+
+local function identity(v)
+  return v
+end
+
 -- ZCL-backed lock settings, keyed by their owed-write key. Each entry knows its
--- attribute, ZCL type, the desired value (with the pre-adoption default), and
--- how to adopt a lock-reported value as desired. rawGet() returning nil means
--- the installer never configured the setting here.
+-- attribute and ZCL type, its state field (also its persist key), its proxy
+-- setting name, how its value maps to the ZCL value, and how history names it.
+-- A setting with a value list offers the driver.xml list less what the lock
+-- refused, plus the lock's own value when the list lacks it.
 local SETTING_ATTRS = {
   ["attr:autolock"] = {
     attr = ATTR_AUTO_RELOCK,
     cap = "has_auto_lock_time",
-    type = 0x23, -- u32
-    rawGet = function()
-      return state.autoLockSeconds
+    type = 0x23, -- u32 seconds, 0 = off
+    field = "autoLockSeconds",
+    name = "auto_lock_time",
+    label = "Auto lock",
+    toZcl = identity,
+    fromZcl = identity,
+    text = function(v)
+      return v == 0 and "OFF" or secondsText(v)
     end,
-    get = function()
-      return state.autoLockSeconds or 0
-    end,
-    adopt = function(v)
-      state.autoLockSeconds = v
-      persist:set("autoLockSeconds", v)
-      notify("SETTING_CHANGED", { NAME = "auto_lock_time", VALUE = tostring(v) })
-    end,
+    list = {
+      cap = "auto_lock_time_values",
+      displayCap = "auto_lock_time_display_values",
+      values = { 0, 15, 30, 60, 120, 180, 300, 600, 1200, 1800 },
+    },
   },
   ["attr:volume"] = {
     attr = ATTR_SOUND_VOLUME,
     cap = "has_volume",
     type = 0x20, -- u8
-    rawGet = function()
-      return state.volume
+    field = "volume",
+    name = "volume",
+    label = "Keypad volume",
+    toZcl = function(v)
+      return VOLUME_TO_ZCL[v]
     end,
-    get = function()
-      return VOLUME_TO_ZCL[state.volume or "high"] or 2
+    fromZcl = function(z)
+      return ZCL_TO_VOLUME[z]
     end,
-    adopt = function(v)
-      state.volume = ZCL_TO_VOLUME[v] or "high"
-      persist:set("volume", state.volume)
-      notify("SETTING_CHANGED", { NAME = "volume", VALUE = state.volume })
-    end,
+    text = tostring,
   },
   ["attr:onetouch"] = {
     attr = ATTR_ONE_TOUCH_LOCKING,
     cap = "has_one_touch_locking",
     keypadOnly = true,
     type = 0x10, -- bool
-    rawGet = function()
-      return state.oneTouchLocking
+    field = "oneTouchLocking",
+    name = "one_touch_locking",
+    label = "One touch locking",
+    toZcl = function(v)
+      return v and 1 or 0
     end,
-    get = function()
-      local enabled = state.oneTouchLocking
-      if enabled == nil then
-        enabled = true
-      end
-      return enabled and 1 or 0
+    fromZcl = function(z)
+      return z ~= 0
     end,
-    adopt = function(v)
-      state.oneTouchLocking = v ~= 0
-      persist:set("oneTouchLocking", state.oneTouchLocking)
-      notify("SETTING_CHANGED", { NAME = "one_touch_locking", VALUE = tostring(state.oneTouchLocking) })
+    text = function(v)
+      return v and "on" or "off"
     end,
   },
   ["attr:wrongcode"] = {
@@ -1251,43 +1310,69 @@ local SETTING_ATTRS = {
     cap = "has_wrong_code_attempts",
     keypadOnly = true,
     type = 0x20, -- u8
-    rawGet = function()
-      return state.wrongCodeAttempts
-    end,
-    get = function()
-      return state.wrongCodeAttempts or 3
-    end,
-    adopt = function(v)
-      state.wrongCodeAttempts = v
-      persist:set("wrongCodeAttempts", v)
-      notify("SETTING_CHANGED", { NAME = "wrong_code_attempts", VALUE = tostring(v) })
-    end,
+    field = "wrongCodeAttempts",
+    name = "wrong_code_attempts",
+    label = "Wrong code attempts",
+    toZcl = identity,
+    fromZcl = identity,
+    text = tostring,
+    list = { cap = "wrong_code_attempts_values", values = { 1, 2, 3, 4, 5, 6, 7 } },
   },
   ["attr:shutout"] = {
     attr = ATTR_SHUTOUT_TIME,
     cap = "has_shutout_timer",
     keypadOnly = true,
-    type = 0x20, -- u8
-    rawGet = function()
-      return state.shutoutTimer
-    end,
-    get = function()
-      return state.shutoutTimer or 60
-    end,
-    adopt = function(v)
-      state.shutoutTimer = v
-      persist:set("shutoutTimer", v)
-      notify("SETTING_CHANGED", { NAME = "shutout_timer", VALUE = tostring(v) })
-    end,
+    type = 0x20, -- u8 seconds
+    field = "shutoutTimer",
+    name = "shutout_timer",
+    label = "Shutout timer",
+    toZcl = identity,
+    fromZcl = identity,
+    text = secondsText,
+    list = {
+      cap = "shutout_timer_values",
+      displayCap = "shutout_timer_display_values",
+      values = { 5, 10, 30, 60, 120 },
+    },
   },
 }
+
+--- Whether the lock refused a setting's ZCL value (on its current firmware).
+local function isRefused(key, z)
+  local values = state.refused.values[key]
+  return values ~= nil and values[tostring(z)] == true
+end
+
+--- Tell the proxy the values a list-backed setting offers.
+local function notifySettingValues(key)
+  local s = SETTING_ATTRS[key]
+  local current = state[s.field]
+  local values = {}
+  for _, v in ipairs(s.list.values) do
+    if v ~= current and not isRefused(key, v) then
+      values[#values + 1] = v
+    end
+  end
+  if current ~= nil then
+    values[#values + 1] = current
+    table.sort(values)
+  end
+  local texts = {}
+  for i, v in ipairs(values) do
+    texts[i] = s.text(v)
+  end
+  notify("CAPABILITY_CHANGED", { NAME = s.list.cap, VALUE = table.concat(values, ", ") })
+  if s.list.displayCap then
+    notify("CAPABILITY_CHANGED", { NAME = s.list.displayCap, VALUE = table.concat(texts, ",") })
+  end
+end
 
 --- Write a ZCL-backed setting's desired value to the lock via a global Write
 --- Attributes frame, tied to its owed-write entry.
 local function writeSettingAttr(key)
   log:trace("writeSettingAttr(%s)", key)
   local s = SETTING_ATTRS[key]
-  local v = s.get()
+  local v = s.toZcl(state[s.field])
   local payload
   if s.type == 0x23 then
     payload = u16le(s.attr) .. string.char(s.type) .. u32le(v)
@@ -1295,6 +1380,22 @@ local function writeSettingAttr(key)
     payload = u16le(s.attr) .. string.char(s.type) .. string.char(v % 256)
   end
   markPendingSent(key, writeAttributes(CLUSTER_DOORLOCK, payload))
+end
+
+--- Take a value the lock holds as the setting's, and tell the proxy.
+local function adoptSetting(key, z)
+  local s = SETTING_ATTRS[key]
+  local v = s.fromZcl(z)
+  if v == nil then
+    return
+  end
+  state[s.field] = v
+  persist:set(s.field, v)
+  notify("SETTING_CHANGED", { NAME = s.name, VALUE = tostring(v) })
+  if s.list then
+    notifySettingValues(key)
+    notify("LOCK_CAPABILITIES_CHANGED", {})
+  end
 end
 
 --- Reconcile a lock-reported setting: the lock is the source of truth. A
@@ -1307,8 +1408,9 @@ local function reconcileSetting(key, reported)
   if state.pending[key] ~= nil then
     return
   end
-  if s.rawGet() == nil or s.get() ~= reported then
-    s.adopt(reported)
+  local current = state[s.field]
+  if current == nil or s.toZcl(current) ~= reported then
+    adoptSetting(key, reported)
   end
 end
 
@@ -1324,6 +1426,81 @@ local function settingCapEnabled(key)
     return false
   end
   return true
+end
+
+--- The lock's settings for the proxy. A lock setting is listed only when the
+--- lock offers it, with the value it holds; none is made up for one it lacks.
+local function notifySettings()
+  log:trace("notifySettings()")
+  local function setting(key)
+    local s = SETTING_ATTRS[key]
+    local v = state[s.field]
+    if v == nil or not settingCapEnabled(key) then
+      return ""
+    end
+    return XMLTag(s.name, tostring(v))
+  end
+  local body = XMLTag("admin_code", state.adminCode)
+    .. setting("attr:autolock")
+    .. XMLTag("log_item_count", state.logItemCount)
+    .. XMLTag("schedule_lockout_enabled", tostring(state.scheduleLockoutEnabled))
+    .. XMLTag("lock_mode", "normal")
+    .. XMLTag("log_failed_attempts", "false")
+    .. setting("attr:wrongcode")
+    .. setting("attr:shutout")
+    .. XMLTag("language", "English")
+    .. setting("attr:volume")
+    .. setting("attr:onetouch")
+  notify("SETTINGS", XMLTag("lock_settings", body, nil, false))
+end
+
+--- Take a Control4 change to a lock setting. It is written, as an owed write,
+--- only when the lock offers the setting and has not refused the value.
+--- @param key string
+--- @param v any The value in the proxy's terms; nil for none it can take.
+local function takeSetting(key, v)
+  local s = SETTING_ATTRS[key]
+  local current = state[s.field]
+  if v ~= nil and v ~= current and settingCapEnabled(key) then
+    if isRefused(key, s.toZcl(v)) then
+      notifyLockChanged(string.format("%s %s - Not supported by this device", s.label, s.text(v)), "Control4", false)
+    else
+      current = v
+      state[s.field] = v
+      persist:set(s.field, v)
+      registerPending(key, "attr", s.attr, nil, nil)
+      writeSettingAttr(key)
+    end
+  end
+  -- The echo releases the proxy's settings UI, with the value that stands; for a
+  -- setting the lock does not offer that is SETTINGS, which leaves it out.
+  if current ~= nil and settingCapEnabled(key) then
+    notify("SETTING_CHANGED", { NAME = s.name, VALUE = tostring(current) })
+  else
+    notifySettings()
+  end
+end
+
+--- The lock refused the value written for a setting: say so, write it no more,
+--- and read back the value the lock kept. A refusal of a write a newer one has
+--- replaced is left to that one's answer.
+refuseSettingValue = function(key, seq)
+  local e = state.pending[key]
+  if e == nil or e.seq ~= seq then
+    return
+  end
+  local s = SETTING_ATTRS[key]
+  local v = state[s.field]
+  local refused = state.refused.values
+  refused[key] = refused[key] or {}
+  refused[key][tostring(s.toZcl(v))] = true
+  persist:set("settingRefused", state.refused)
+  cancelPending(key)
+  local msg = string.format("%s %s - Not supported by this device", s.label, s.text(v))
+  log:info("Lock refused %s", msg)
+  addHistory(msg, "Control4")
+  notifyLockChanged(msg, "Control4", false)
+  readAttributes(CLUSTER_DOORLOCK, { s.attr })
 end
 
 --- Record whether the lock supports a ZCL-backed setting and show/hide its
@@ -1354,14 +1531,35 @@ local function setSettingSupport(key, supported)
   end
 end
 
---- Replay every ZCL-backed setting's effective capability to the proxy. Unknown
---- attributes count as unsupported (matching the restrictive driver.xml
---- defaults), and keypad-only settings stay hidden until a keypad is confirmed.
+--- Replay every ZCL-backed setting's effective capability, and the values each
+--- list-backed one offers, to the proxy. Unknown attributes count as unsupported
+--- (matching the restrictive driver.xml defaults), and keypad-only settings stay
+--- hidden until a keypad is confirmed.
 applySettingCapabilities = function()
   for key, s in pairs(SETTING_ATTRS) do
     notify("CAPABILITY_CHANGED", { NAME = s.cap, VALUE = settingCapEnabled(key) and "true" or "false" })
+    if s.list then
+      notifySettingValues(key)
+    end
   end
   notify("LOCK_CAPABILITIES_CHANGED", {})
+end
+
+--- Refusals hold for the firmware that made them: other firmware is offered
+--- every value again.
+--- @param build string The lock's SWBuildID.
+local function noteFirmware(build)
+  local r = state.refused
+  if r.build == build then
+    return
+  end
+  if r.build ~= nil and next(r.values) ~= nil then
+    log:info("Lock firmware is now %s; offering again what %s refused", build, r.build)
+    r.values = {}
+    applySettingCapabilities()
+  end
+  r.build = build
+  persist:set("settingRefused", r)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1378,14 +1576,26 @@ local CAP_PROBE_INTERVAL = 5 * ONE_SECOND
 local CAP_PROBE_MAX_TRIES = 12
 local capProbeTries = 0
 
---- True once every ZCL-backed setting has a verdict and the keypad has answered.
+-- Edge probe of the lock's user ids. ZCL allows 0 to N-1 or 1 to N for N PIN
+-- users, so Get PIN goes to ids 0 and N and the lock's answers settle which.
+local idProbe -- { n, seqs = { [seq] = id }, answers = { [id] = answered } } (transient)
+
+--- True once every ZCL-backed setting has a verdict, the keypad has answered,
+--- and a keypad lock has answered or refused both probed user ids.
 capsResolved = function()
   for key in pairs(SETTING_ATTRS) do
     if state.settingSupport[key] == nil then
       return false
     end
   end
-  return state.keypadKnown == true
+  if not state.keypadKnown then
+    return false
+  end
+  local p = idProbe
+  if not state.supportsUserCodes or (p and p.n < 1) then
+    return true
+  end
+  return p ~= nil and p.answers[0] ~= nil and p.answers[p.n] ~= nil
 end
 
 --- Issue the capability reads and the keypad probe once.
@@ -1413,9 +1623,62 @@ stopCapProbe = function()
   CancelTimer(TIMER_CAP_PROBE)
 end
 
+--- Ask the lock for ids 0 and N, each until it answers. Each capability probe
+--- reads N again, so an answer the lock missed is asked for on the next round.
+--- @param n integer NumberOfPINUsersSupported
+local function probeUserIds(n)
+  if not idProbe or idProbe.n ~= n then
+    idProbe = { n = n, seqs = {}, answers = {} }
+  end
+  if n < 1 then
+    return
+  end
+  for _, id in ipairs({ 0, n }) do
+    if idProbe.answers[id] == nil then
+      idProbe.seqs[sendCommand(CLUSTER_DOORLOCK, DL_GET_PIN, u16le(id))] = id
+    end
+  end
+end
+
+--- Take the lock's answer to a probed id: a Get PIN response (answered) or an
+--- error status (refused). Both edges in, the ids are 0 to N-1 if only 0 was
+--- answered, 1 to N if only N was, and unsettled otherwise.
+--- @param id integer|nil
+--- @param answered boolean
+local function noteUserIdAnswer(id, answered)
+  local p = idProbe
+  if not p or (id ~= 0 and id ~= p.n) or p.answers[id] ~= nil then
+    return
+  end
+  p.answers[id] = answered
+  local zero, top = p.answers[0], p.answers[p.n]
+  if zero == nil or top == nil then
+    return
+  end
+  if capsResolved() then
+    stopCapProbe()
+  end
+  local ids
+  if zero and not top then
+    ids = { first = 0, last = p.n - 1 }
+  elseif top and not zero then
+    ids = { first = 1, last = p.n }
+  end
+  local old = state.userIds
+  if (old and old.first) == (ids and ids.first) and (old and old.last) == (ids and ids.last) then
+    return
+  end
+  state.userIds = ids
+  persist:set("userIds", ids)
+  local first, last = userIdRange()
+  log:info("Lock user ids are %d to %d%s", first, last, ids and "" or " (unsettled by the lock's answers)")
+  applyUserCodeCapabilities()
+end
+
 --- Probe now, then retry on a bounded timer until the verdicts resolve. Run on
 --- every online transition, so a module swap is re-probed too.
 local function startCapProbe()
+  idProbe = nil
   probeCapabilities()
   capProbeTries = 0
   if capsResolved() then
@@ -1459,6 +1722,31 @@ resendPendingEntry = function(key, e)
   end
 end
 
+--- The lowest of the lock's user ids that no stored user holds and no owed or
+--- uncleared clear is still emptying; nil when the lock is full.
+--- @return integer|nil
+local function freeSlot()
+  local taken = {}
+  for _, u in pairs(state.users) do
+    taken[u.slot] = true
+  end
+  for _, e in pairs(state.pending) do
+    if e.kind == "clear" then
+      taken[e.id] = true
+    end
+  end
+  for _, e in pairs(state.uncleared) do
+    taken[e.id] = true
+  end
+  local first, last = userIdRange()
+  for slot = first, last do
+    if not taken[slot] then
+      return slot
+    end
+  end
+  return nil
+end
+
 --- Add or edit a user code. tParams carries USER_ID/USER_NAME/PASSCODE/IS_ACTIVE
 --- and optional schedule fields. The lock proxy has no reject-with-message path,
 --- so when a save would trip a lock limit we refuse it and surface the reason in
@@ -1474,20 +1762,23 @@ local function upsertUser(tParams, isEdit)
   end
   local id = tointeger(Select(tParams, "USER_ID"))
   if id == nil then
-    for i = 1, state.limits.maxUsers do
-      if state.users[i] == nil then
-        id = i
-        break
-      end
+    id = 1
+    while state.users[id] ~= nil do
+      id = id + 1
     end
   end
-  if id == nil or id > state.limits.maxUsers then
-    log:warn("No free user slot (max %d)", state.limits.maxUsers)
-    notifyLockChanged(
-      string.format("Cannot add user: lock supports %d codes", state.limits.maxUsers),
-      "Control4",
-      false
-    )
+  -- A stored user keeps its slot; a new one takes the lowest free of the lock's ids.
+  local prev = state.users[id]
+  local slot
+  if prev then
+    slot = prev.slot
+  else
+    slot = freeSlot()
+  end
+  if slot == nil then
+    local first, last = userIdRange()
+    log:warn("No free user slot (lock ids %d to %d)", first, last)
+    notifyLockChanged(string.format("Cannot add user: lock supports %d codes", last - first + 1), "Control4", false)
     return
   end
   local code = Select(tParams, "PASSCODE")
@@ -1503,10 +1794,10 @@ local function upsertUser(tParams, isEdit)
       return
     end
   end
-  local prev = state.users[id]
   local prevCode = prev and prev.code or nil
   local prevActive = prev and toboolean(prev.active)
   local u = prev or {}
+  u.slot = slot
   u.name = Select(tParams, "USER_NAME") or u.name or ("User " .. id)
   if not IsEmpty(code) then
     u.code = tostring(code)
@@ -1630,16 +1921,17 @@ function RFP.DELETE_USER(idBinding, strCommand, tParams)
   if id == nil or state.users[id] == nil then
     return
   end
-  local name = state.users[id].name
+  local name, slot = state.users[id].name, state.users[id].slot
   state.users[id] = nil
   saveUsers()
   -- Any owed writes for the user are superseded by the revocation; the clear
   -- itself stays owed until the lock confirms it (a missed clear would leave a
-  -- revoked PIN working while the UI says it is gone).
+  -- revoked PIN working while the UI says it is gone). It is keyed by the slot,
+  -- which stays taken until then.
   cancelPending("pin:" .. id)
   cancelPending("sched:" .. id)
-  registerPending("clear:" .. id, "clear", id, string.format("Deleted User %d (%s)", id, name or ""), nil)
-  markPendingSent("clear:" .. id, sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(id)))
+  registerPending("clear:" .. slot, "clear", slot, string.format("Deleted User %d (%s)", id, name or ""), nil)
+  markPendingSent("clear:" .. slot, sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(slot)))
   notify("USER_DELETED", { USER_ID = id, USER_NAME = name })
 end
 
@@ -1648,17 +1940,7 @@ function RFP.SET_AUTO_LOCK_SECONDS(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local secs = tointeger(Select(tParams, "SECONDS")) or 0
-  if secs == state.autoLockSeconds then
-    -- Nothing owed to the lock, but the echo still releases the settings UI.
-    notify("SETTING_CHANGED", { NAME = "auto_lock_time", VALUE = tostring(secs) })
-    return
-  end
-  state.autoLockSeconds = secs
-  persist:set("autoLockSeconds", secs)
-  registerPending("attr:autolock", "attr", ATTR_AUTO_RELOCK, nil, nil)
-  writeSettingAttr("attr:autolock")
-  notify("SETTING_CHANGED", { NAME = "auto_lock_time", VALUE = tostring(secs) })
+  takeSetting("attr:autolock", tointeger(Select(tParams, "SECONDS")))
 end
 
 function RFP.SET_ADMIN_CODE(idBinding, strCommand, tParams)
@@ -1713,25 +1995,8 @@ function RFP.SET_VOLUME(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local volume = tostring(Select(tParams, "VOLUME") or "high")
-  if VOLUME_TO_ZCL[volume] == nil then
-    volume = "high"
-  end
-  -- Kwikset SmartCode Zigbee locks expose only silent and high; the lock rejects
-  -- the ZCL "low" value (INVALID_VALUE), so fold "low" into "high" to keep keypad
-  -- feedback audible and the proxy, persistence, and lock in agreement.
-  if volume == "low" then
-    volume = "high"
-  end
-  if volume == state.volume then
-    notify("SETTING_CHANGED", { NAME = "volume", VALUE = volume })
-    return
-  end
-  state.volume = volume
-  persist:set("volume", volume)
-  registerPending("attr:volume", "attr", ATTR_SOUND_VOLUME, nil, nil)
-  writeSettingAttr("attr:volume")
-  notify("SETTING_CHANGED", { NAME = "volume", VALUE = volume })
+  local volume = tostring(Select(tParams, "VOLUME"))
+  takeSetting("attr:volume", VOLUME_TO_ZCL[volume] and volume or nil)
 end
 
 function RFP.SET_ONE_TOUCH_LOCKING(idBinding, strCommand, tParams)
@@ -1739,16 +2004,11 @@ function RFP.SET_ONE_TOUCH_LOCKING(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local enabled = toboolean(Select(tParams, "ENABLED")) or false
-  if enabled == state.oneTouchLocking then
-    notify("SETTING_CHANGED", { NAME = "one_touch_locking", VALUE = tostring(enabled) })
-    return
+  local enabled = Select(tParams, "ENABLED")
+  if enabled ~= nil then
+    enabled = toboolean(enabled)
   end
-  state.oneTouchLocking = enabled
-  persist:set("oneTouchLocking", enabled)
-  registerPending("attr:onetouch", "attr", ATTR_ONE_TOUCH_LOCKING, nil, nil)
-  writeSettingAttr("attr:onetouch")
-  notify("SETTING_CHANGED", { NAME = "one_touch_locking", VALUE = tostring(enabled) })
+  takeSetting("attr:onetouch", enabled)
 end
 
 function RFP.SET_WRONG_CODE_ATTEMPTS(idBinding, strCommand, tParams)
@@ -1756,16 +2016,7 @@ function RFP.SET_WRONG_CODE_ATTEMPTS(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local count = tointeger(Select(tParams, "COUNT")) or 3
-  if count == state.wrongCodeAttempts then
-    notify("SETTING_CHANGED", { NAME = "wrong_code_attempts", VALUE = tostring(count) })
-    return
-  end
-  state.wrongCodeAttempts = count
-  persist:set("wrongCodeAttempts", count)
-  registerPending("attr:wrongcode", "attr", ATTR_WRONG_CODE_LIMIT, nil, nil)
-  writeSettingAttr("attr:wrongcode")
-  notify("SETTING_CHANGED", { NAME = "wrong_code_attempts", VALUE = tostring(count) })
+  takeSetting("attr:wrongcode", tointeger(Select(tParams, "COUNT")))
 end
 
 function RFP.SET_SHUTOUT_TIMER(idBinding, strCommand, tParams)
@@ -1773,16 +2024,7 @@ function RFP.SET_SHUTOUT_TIMER(idBinding, strCommand, tParams)
   if idBinding ~= PROXY_BINDING then
     return
   end
-  local secs = tointeger(Select(tParams, "SECONDS")) or 60
-  if secs == state.shutoutTimer then
-    notify("SETTING_CHANGED", { NAME = "shutout_timer", VALUE = tostring(secs) })
-    return
-  end
-  state.shutoutTimer = secs
-  persist:set("shutoutTimer", secs)
-  registerPending("attr:shutout", "attr", ATTR_SHUTOUT_TIME, nil, nil)
-  writeSettingAttr("attr:shutout")
-  notify("SETTING_CHANGED", { NAME = "shutout_timer", VALUE = tostring(secs) })
+  takeSetting("attr:shutout", tointeger(Select(tParams, "SECONDS")))
 end
 
 -- Settings the proxy may send that have no ZCL mapping (kept for parity).
@@ -1826,11 +2068,18 @@ function EC.Sync_Users(tParams)
     registerPending("pin:" .. id, "pin", id, nil, nil)
     registerPending("sched:" .. id, "sched", id, nil, nil)
     if u.active and u.code then
-      sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(id))
+      sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(u.slot))
     end
     writeUserPin(id, u.active and u.code or nil)
     writeUserSchedule(id, u)
   end
+  -- A deleted user's clear the lock did not take is owed again.
+  for key, e in pairs(state.uncleared) do
+    registerPending(key, "clear", e.id, e.msg, nil)
+    markPendingSent(key, sendCommand(CLUSTER_DOORLOCK, DL_CLEAR_PIN, u16le(e.id)))
+  end
+  state.uncleared = {}
+  persist:set("unclearedSlots", state.uncleared)
   notifyUsers()
 end
 
@@ -1901,6 +2150,7 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         local swBuild = decodeStringAttr(payload, cmd, ATTR_SW_BUILD)
         if not IsEmpty(swBuild) then
           UpdateProperty("Firmware Version", swBuild)
+          noteFirmware(swBuild)
         end
       end
     elseif clusterId == CLUSTER_DOORLOCK then
@@ -1930,6 +2180,7 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         -- Capability limits reported by the lock; use them for validation.
         if attrs[ATTR_NUM_PIN_USERS] and attrs[ATTR_NUM_PIN_USERS].value then
           state.limits.maxUsers = attrs[ATTR_NUM_PIN_USERS].value
+          probeUserIds(state.limits.maxUsers)
         end
         if attrs[ATTR_MIN_PIN_LEN] and attrs[ATTR_MIN_PIN_LEN].value then
           state.limits.minPin = attrs[ATTR_MIN_PIN_LEN].value
@@ -2010,6 +2261,9 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         -- The lock understood GetPINCode, so it has a keypad. Restore user
         -- management in case this driver was moved onto a keypad lock.
         setUserCodeSupport(true)
+        if #payload >= 2 then
+          noteUserIdAnswer(payload:byte(1) + payload:byte(2) * 256, true)
+        end
       elseif clusterSpecific and DL_RESPONSE_CMDS[cmd] and #payload >= 1 then
         -- Set/Clear PIN, schedule, and user-type responses echo our sequence
         -- with a status byte - they settle the matching owed write.
@@ -2021,6 +2275,11 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         if status == ZCL_STATUS_UNSUP_CMD and CREDENTIAL_CMDS[respCmd] then
           setUserCodeSupport(false)
           cancelCredentialPending()
+        elseif respCmd == DL_GET_PIN then
+          -- An id outside the lock's range is refused with an error (0x85 on a 916).
+          if status ~= 0 and idProbe then
+            noteUserIdAnswer(idProbe.seqs[seq], false)
+          end
         else
           -- Some stacks ack global writes with a Default Response.
           confirmSeq(seq, status)
