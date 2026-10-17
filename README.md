@@ -325,6 +325,9 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
   the lock's history when the lock's reports arrived late or out of order: each
   report now names the operation it describes by the time on the lock's own
   clock
+- Fixed the lock's last action changing to Control4 within 30 seconds of a
+  keypad or thumbturn operation: a status read that finds the lock as it was no
+  longer reports anything
 
 ### Changed
 
@@ -332,6 +335,9 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
   API, so keypad, thumbturn, and one-touch operations show as they happen
 - Changed the auto-lock, wrong code attempts, and shutout timer lists to follow
   the lock: a value it refuses is dropped, and one set at the lock is added
+- Changed the lock status read every 30 seconds to run only until the lock's
+  real-time binding is in place; after that the status is read hourly with the
+  battery, so the lock is no longer woken every 30 seconds
 
 ## v20260825 - 2026-08-25
 

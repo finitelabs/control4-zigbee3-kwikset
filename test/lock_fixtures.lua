@@ -106,6 +106,7 @@ local seeded = {}
 --- Load the driver as Director does after a driver update, over a store holding
 --- `seed` (lib.persist keys and values).
 --- @param seed table
+--- @return table ctl The ZigbeeV2 shim's controller.
 function F.start(seed)
   KillAllTimers()
   ShimPersistLand()
@@ -122,8 +123,9 @@ function F.start(seed)
   end
   ShimPersistLand()
   persist._persist = {}
-  ShimInstallZigbeeV2()
+  local ctl = ShimInstallZigbeeV2()
   load("DIT_UPDATING")
+  return ctl
 end
 
 --- Load the driver again after a driver update, over what the last load stored.

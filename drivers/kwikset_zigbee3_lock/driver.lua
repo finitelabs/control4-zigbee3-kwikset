@@ -818,18 +818,30 @@ local function updateDriverStatus()
   end
 end
 
--- Until zserver has bound DoorLock, or if the lock refuses the bind, a modest
--- LockState poll is the only way to see physical operations, so it always runs.
--- Deliberate deviation from the event-driven polling convention.
+-- With zserver's DoorLock bind in place the lock pushes each operation itself, so
+-- LockState is read hourly with the battery, as a check on a lost report. Until
+-- then, or if the lock refuses the bind, a 30 s read is the only way to see
+-- physical operations. Deliberate deviation from the event-driven polling convention.
 local STATE_POLL_INTERVAL = 30 * ONE_SECOND
 local BATTERY_POLL_INTERVAL = ONE_HOUR
 
-local function startStatePolling()
+--- Read LockState every 30 s while the binder does not know DoorLock bound.
+local function armStatePoll()
+  local snap = binder and binder:snapshot()
+  if snap and snap.bound[state.dstEndpoint * 65536 + CLUSTER_DOORLOCK] then
+    CancelTimer("StatePoll")
+    return
+  end
   SetTimer("StatePoll", STATE_POLL_INTERVAL, function()
     readAttributes(CLUSTER_DOORLOCK, { ATTR_LOCK_STATE })
   end, true)
+end
+
+local function startStatePolling()
+  armStatePoll()
   SetTimer("BatteryPoll", BATTERY_POLL_INTERVAL, function()
     readAttributes(CLUSTER_POWER, { ATTR_BATT_PCT })
+    readAttributes(CLUSTER_DOORLOCK, { ATTR_LOCK_STATE })
   end, true)
 end
 
@@ -1145,9 +1157,14 @@ local function applyLockStatus(status, op)
   elseif changed then
     told = op or { desc = told.desc, source = "Control4", manual = false }
   end
+  -- A report that changes neither the status nor what the proxy was told (a poll,
+  -- an operation the lock was already in) tells it nothing, as Control4's drivers do.
+  local was = state.told
   state.told = told
-  notifyLockChanged(told.desc, told.source, told.manual)
-  log:info("Lock is %s (%s)", status, tostring(told.desc))
+  if changed or told.desc ~= was.desc or told.source ~= was.source or told.manual ~= was.manual then
+    notifyLockChanged(told.desc, told.source, told.manual)
+    log:info("Lock is %s (%s)", status, tostring(told.desc))
+  end
   if c then
     if c.manual and not c.op then
       -- A physical operation with no actor in the packet: the event log has it.
@@ -2470,6 +2487,9 @@ function establishEventBinds()
       log:info("Real-time event binding in place (endpoint %d)", state.dstEndpoint)
     end
     eventBound = settled
+    if state.online then
+      armStatePoll()
+    end
   end)
 end
 
