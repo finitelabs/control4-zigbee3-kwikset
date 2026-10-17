@@ -47,6 +47,9 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Fixed user codes and the admin code showing in plain text in the driver's log
   at the Trace and Ultra log levels; the log now shows `***REDACTED***` in their
   place
+- Fixed the lock's history in the Control4 app ending at the driver's last load,
+  however many operations the driver had recorded since: each entry is now sent
+  as it is recorded
 
 ### Changed
 

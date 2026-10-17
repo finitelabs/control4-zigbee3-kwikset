@@ -641,22 +641,6 @@ local function historyStamp(t)
   return string.format("%02d/%02d/%04d", dt.month, dt.day, dt.year), string.format("%d:%02d %s", hr, dt.min, ampm)
 end
 
---- Record a history event (newest appended last, capped to HISTORY_MAX).
-local function addHistory(message, source)
-  log:trace("addHistory('%s', '%s')", message, source)
-  local date, time = historyStamp()
-  state.history[#state.history + 1] = {
-    date = date,
-    time = time,
-    message = tostring(message or ""),
-    source = tostring(source or "Control4"),
-  }
-  while #state.history > HISTORY_MAX do
-    table.remove(state.history, 1)
-  end
-  persist:set("history", state.history)
-end
-
 --- Build the <lock_history> XML the lock proxy expects, newest first, limited to
 --- the configured Log Item Count.
 local function historyXml()
@@ -678,6 +662,29 @@ local function historyXml()
       .. "</history_item>"
   end
   return XMLTag("lock_history", body, nil, false)
+end
+
+--- Store the history and send it to the proxy. The proxy asks for it only when the
+--- driver loads and shows what it was last sent, so each change is sent as it happens.
+local function saveHistory()
+  persist:set("history", state.history)
+  notify("HISTORY", historyXml())
+end
+
+--- Record a history event (newest appended last, capped to HISTORY_MAX).
+local function addHistory(message, source)
+  log:trace("addHistory('%s', '%s')", message, source)
+  local date, time = historyStamp()
+  state.history[#state.history + 1] = {
+    date = date,
+    time = time,
+    message = tostring(message or ""),
+    source = tostring(source or "Control4"),
+  }
+  while #state.history > HISTORY_MAX do
+    table.remove(state.history, 1)
+  end
+  saveHistory()
 end
 
 -- ---------------------------------------------------------------------------
@@ -1003,7 +1010,7 @@ local function applyLockStatus(status, lastAction, source, manual)
       -- the cap, which would shift a stored index onto the wrong entry.
       if act.historyEntry then
         act.historyEntry.source = source or "Control4"
-        persist:set("history", state.history)
+        saveHistory()
       end
     end
     notifyLockChanged(state.lastActionDesc, act.source or "Control4", act.manual or false)
