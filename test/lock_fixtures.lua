@@ -60,6 +60,11 @@ end
 function C4:GetVersionInfo()
   return { version = "4.3.0" }
 end
+-- The events the driver fires, as it names them.
+local fired = {}
+function C4:FireEvent(event)
+  fired[#fired + 1] = event
+end
 -- What the driver tells the lock proxy.
 local proxied = {}
 function C4:SendToProxy(binding, command, params)
@@ -234,6 +239,13 @@ function F.proxy(command, params)
   ShimPersistLand()
   RFP[command](F.PROXY, command, params or {})
   ShimPersistLand()
+end
+
+--- The events fired since the last call, in order.
+function F.fired()
+  local out = fired
+  fired = {}
+  return out
 end
 
 --- Everything the proxy was told since the last call, as { command, params }.

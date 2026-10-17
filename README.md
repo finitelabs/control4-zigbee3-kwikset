@@ -321,6 +321,10 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Fixed the lock's history in the Control4 app ending at the driver's last load,
   however many operations the driver had recorded since: each entry is now sent
   as it is recorded
+- Fixed a keypad user's name landing on an earlier thumbturn lock or unlock in
+  the lock's history when the lock's reports arrived late or out of order: each
+  report now names the operation it describes by the time on the lock's own
+  clock
 
 ### Changed
 

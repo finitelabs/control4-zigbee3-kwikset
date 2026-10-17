@@ -166,15 +166,12 @@ local MAX_USERS = 30
 local HISTORY_MAX = 50
 -- A status change within this many seconds of a driver lock/unlock is our own
 -- doing (source "Control4"); an unsolicited change is a physical operation at
--- the lock (source "Manual"). This hardware reports keypad and thumbturn
--- operations only as a bare LOCK_STATE change, with no actor, so origin is all
--- we can infer for them.
+-- the lock (source "Manual") until the lock's report of the operation names it.
 local CMD_ORIGIN_SECS = 8
--- One physical action can arrive twice: a LOCK_STATE report and, for some
--- operations (e.g. one-touch locking), a separate operation event. Reports for
--- the same new state within this window are one action - notified and logged
--- once, and upgraded in place if the later report names the actor.
-local COALESCE_SECS = 4
+-- An operation can name a status change that arrived from MATCH_EARLY_SECS before
+-- its time on the lock's clock (both clocks count whole seconds) to MATCH_LATE_SECS after.
+local MATCH_EARLY_SECS = 2
+local MATCH_LATE_SECS = 30
 
 gInitialized = false
 
@@ -184,16 +181,18 @@ local state = {
   dstEndpoint = 1,
   dstEndpointLearned = false, -- true once the DoorLock cluster itself has spoken
   lockStatus = STATUS_UNKNOWN,
-  lastActionDesc = "", -- human text for LAST_ACTION_DESCRIPTION; the last real
-  -- event, preserved across passive status polls (never the placeholder a poll
-  -- would otherwise carry).
+  -- The last operation LOCK_STATUS_CHANGED described: { desc, source, manual }.
+  told = { desc = "", source = "Control4", manual = false },
   battery = nil,
   online = nil,
   cmdSentAt = 0, -- os.time() of the last RF lock/unlock, for the jam debounce
   faultRecheck = false, -- one silent re-poll consumed for a mid-throw "fault"
-  action = nil, -- last applied transition, for coalescing dual reports (ephemeral)
+  -- Recent status changes in the order they arrived, each { status, at, source,
+  -- manual, entry, op }, and the lock's reports of its operations, each { status,
+  -- at, timed, desc, source, manual, live, seq }, `at` on the lock's clock (transient).
+  changes = {},
+  ops = {},
   logSupported = nil, -- true if the lock has an event log (attr 0x0010 > 0)
-  lastLogEntryId = nil, -- newest event-log id already attributed, to skip repeats
   -- Lock-side config settings, nil until the lock reports a value. The lock's
   -- value is adopted; a Control4 change goes to the lock as an owed write.
   autoLockSeconds = nil,
@@ -249,6 +248,40 @@ end
 
 local function u32le(v)
   return string.char(v % 256, math.floor(v / 256) % 256, math.floor(v / 65536) % 256, math.floor(v / 16777216) % 256)
+end
+
+--- The little-endian u32 at `pos` in `data`, or nil past its end.
+--- @param data string
+--- @param pos integer
+--- @return integer|nil
+local function u32At(data, pos)
+  local a, b, c, d = data:byte(pos, pos + 3)
+  return d and a + b * 256 + c * 65536 + d * 16777216 or nil
+end
+
+--- ZCL LocalTime for a date and a minute of that day: seconds since 2000-01-01
+--- 00:00 on the lock's clock, which keeps local wall-clock time (DST included),
+--- so it is counted on the calendar alone, with no time zone.
+--- @param year integer
+--- @param month integer
+--- @param day integer
+--- @param minutes integer Minutes from midnight.
+--- @return integer
+local function zclLocalTime(year, month, day, minutes)
+  -- Days from 1970-01-01 (Hinnant's days_from_civil), less the 10957 to 2000-01-01.
+  local y = month <= 2 and year - 1 or year
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local doy = math.floor((153 * ((month + 9) % 12) + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return (era * 146097 + doe - 719468 - 10957) * 86400 + minutes * 60
+end
+
+--- The time now on the lock's clock, in the same form.
+--- @return integer
+local function lockNow()
+  local dt = os.date("*t", os.time())
+  return zclLocalTime(dt.year, dt.month, dt.day, dt.hour * 60 + dt.min) + dt.sec
 end
 
 --- Build a ZCL header. clusterSpecific = false is a global command. Also
@@ -672,6 +705,7 @@ local function saveHistory()
 end
 
 --- Record a history event (newest appended last, capped to HISTORY_MAX).
+--- @return table entry The entry, held by reference: the cap shifts indexes.
 local function addHistory(message, source)
   log:trace("addHistory('%s', '%s')", message, source)
   local date, time = historyStamp()
@@ -681,10 +715,12 @@ local function addHistory(message, source)
     message = tostring(message or ""),
     source = tostring(source or "Control4"),
   }
+  local entry = state.history[#state.history]
   while #state.history > HISTORY_MAX do
     table.remove(state.history, 1)
   end
   saveHistory()
+  return entry
 end
 
 -- ---------------------------------------------------------------------------
@@ -973,106 +1009,158 @@ end
 
 --- Ask the lock for its newest event-log record, to attribute a physical
 --- operation the bare LOCK_STATE report could not. Deferred briefly so the lock
---- has committed the entry (it stays awake for a few seconds after operating).
+--- has committed the entry (it stays awake for a few seconds after operating),
+--- and not asked once an operation event has named the change.
 local function requestLogAttribution()
   if not state.logSupported then
     return
   end
   SetTimer("LogAttr", 400, function()
-    sendCommand(CLUSTER_DOORLOCK, DL_GET_LOG_RECORD, u16le(0))
+    local c = state.changes[#state.changes]
+    if c and not c.op then
+      sendCommand(CLUSTER_DOORLOCK, DL_GET_LOG_RECORD, u16le(0))
+    end
   end)
 end
 
+--- Forget the changes and operations too old to pair again; a change keeps the
+--- source it was given, and an operation that named one goes with it.
+--- @param now integer The lock's clock.
+local function pruneOperations(now)
+  local horizon = now - 2 * MATCH_LATE_SECS
+  local kept, gone = {}, {}
+  for _, c in ipairs(state.changes) do
+    if c.at >= horizon then
+      kept[#kept + 1] = c
+    elseif c.op then
+      gone[c.op] = true
+    end
+  end
+  state.changes = kept
+  kept = {}
+  for _, op in ipairs(state.ops) do
+    if not gone[op] and op.at >= horizon - MATCH_LATE_SECS then
+      kept[#kept + 1] = op
+    end
+  end
+  state.ops = kept
+end
+
+--- Pair the lock's operations with the status changes they describe, in the order of
+--- the lock's own clock: each names the first change of its status after the change
+--- the operation before it named, among those that arrived within its bounds. A name
+--- given before an earlier operation's report arrived so moves to its own change.
+--- @return boolean moved Whether a history entry's source changed.
+local function matchOperations()
+  table.sort(state.ops, function(a, b)
+    return a.at < b.at or (a.at == b.at and a.seq < b.seq)
+  end)
+  for _, c in ipairs(state.changes) do
+    c.op = nil
+  end
+  local from = 1
+  for _, op in ipairs(state.ops) do
+    for i = from, #state.changes do
+      local c = state.changes[i]
+      if c.status == op.status and c.at >= op.at - MATCH_EARLY_SECS and c.at <= op.at + MATCH_LATE_SECS then
+        c.op, from = op, i + 1
+        break
+      end
+    end
+  end
+  local moved = false
+  for _, c in ipairs(state.changes) do
+    local source = c.op and c.op.source or c.source
+    if c.entry and c.entry.source ~= source then
+      c.entry.source, moved = source, true
+    end
+  end
+  return moved
+end
+
+local opSeq = 0
+
 --- Apply a lock status to the proxy, history, and events.
 --- @param status string one of the STATUS_* proxy values
---- @param lastAction string? explicit action text when the actor is known (an
----   operation event); nil for a bare LOCK_STATE report, whose actor is inferred
---- @param source string? explicit source when known; nil to infer from origin
---- @param manual boolean? explicit manual flag when known; nil to infer
-local function applyLockStatus(status, lastAction, source, manual)
-  log:trace("applyLockStatus('%s', '%s', '%s')", status, tostring(lastAction), tostring(source))
+--- @param op table|nil the lock's report of the operation, from an operation event
+---   (live) or the event log: { at, timed, desc, source, manual, live }; nil for a bare
+---   LOCK_STATE report, whose actor is inferred
+local function applyLockStatus(status, op)
+  log:trace("applyLockStatus('%s', '%s')", status, tostring(op and op.desc))
+  local now = lockNow()
+  if op then
+    for _, o in ipairs(state.ops) do
+      if op.timed and o.timed and o.at == op.at and o.status == status then
+        return -- the same operation again: its event and its log record
+      end
+    end
+    opSeq = opSeq + 1
+    op.status, op.seq = status, opSeq
+    state.ops[#state.ops + 1] = op
+  end
   local prev = state.lockStatus
-  local changed = status ~= prev
-  local attributed = not IsEmpty(lastAction)
-  local now = os.time()
-  state.lockStatus = status
-
-  -- Coalesce: the lock can report one action twice (a LOCK_STATE report and,
-  -- for some operations, an operation event). A same-state report inside the
-  -- window is that same action - upgrade its attribution if this report names
-  -- the actor, never downgrade, and never log or fire it a second time.
-  local act = state.action
-  if not changed and act and act.status == status and (now - act.at) <= COALESCE_SECS then
-    if attributed and not act.attributed then
-      act.desc, act.source, act.manual, act.attributed = lastAction, source, manual, true
-      state.lastActionDesc = lastAction
-      -- Hold the entry itself, not its index: addHistory trims from the front at
-      -- the cap, which would shift a stored index onto the wrong entry.
-      if act.historyEntry then
-        act.historyEntry.source = source or "Control4"
-        saveHistory()
-      end
-    end
-    notifyLockChanged(state.lastActionDesc, act.source or "Control4", act.manual or false)
-    return
-  end
-
-  -- Infer the actor for a bare report: a change we just commanded is ours;
-  -- an otherwise-unsolicited change was a physical operation at the lock. The
-  -- initial sync out of UNKNOWN (a reload reading current state) and a passive
-  -- re-sync that changed nothing are not operations and assert no actor.
-  if not attributed then
-    if changed and prev ~= STATUS_UNKNOWN then
-      local ours = (now - (state.cmdSentAt or 0)) <= CMD_ORIGIN_SECS
-      source = ours and "Control4" or "Manual"
-      manual = not ours
-    else
-      source, manual = "Control4", false
-    end
-  end
-
-  if attributed then
-    state.lastActionDesc = lastAction
-  elseif changed and prev ~= STATUS_UNKNOWN then
-    state.lastActionDesc = STATUS_LABEL[status] or ""
-  end
-  -- LOCK_STATUS_CHANGED is sent on every report, even an unchanged one: it
-  -- carries the last-action/source/manual metadata the proxy must see, so the
-  -- send is intentionally not gated on `changed` (events + history below are).
-  notifyLockChanged(state.lastActionDesc, source, manual)
-
+  -- A log record tells what the lock did, not what it is now.
+  local changed = status ~= prev and (op == nil or op.live)
   if changed then
-    local historyEntry
-    -- Real transitions log to history and fire the alert event; the initial
-    -- sync out of UNKNOWN (a reload seeding current state) must do neither, so a
-    -- reload never announces a lock that did not actually move.
-    if prev ~= STATUS_UNKNOWN and status ~= STATUS_UNKNOWN then
-      addHistory(STATUS_LABEL[status] or status, source or "Control4")
-      historyEntry = state.history[#state.history]
-      if status == STATUS_LOCKED then
-        C4:FireEvent(EVENT_LOCKED)
-      elseif status == STATUS_UNLOCKED then
-        C4:FireEvent(EVENT_UNLOCKED)
-      elseif status == STATUS_FAULT then
-        C4:FireEvent(EVENT_JAMMED)
+    state.lockStatus = status
+  end
+  -- Real transitions log to history and fire the alert event; the initial sync
+  -- out of UNKNOWN (a reload seeding current state) must do neither, so a reload
+  -- never announces a lock that did not actually move. A change we just
+  -- commanded is ours; an otherwise-unsolicited one was a physical operation.
+  local c
+  if changed and prev ~= STATUS_UNKNOWN and status ~= STATUS_UNKNOWN then
+    local ours = (os.time() - (state.cmdSentAt or 0)) <= CMD_ORIGIN_SECS
+    c = { status = status, at = now, source = ours and "Control4" or "Manual", manual = not ours }
+    state.changes[#state.changes + 1] = c
+  end
+  pruneOperations(now)
+  local moved = matchOperations()
+  if op then
+    -- One that names no change as it arrives (the reading after a reload, a lock or
+    -- unlock of a lock already there, an old log record) is not kept to name a later one.
+    local named = false
+    for _, ch in ipairs(state.changes) do
+      named = named or ch.op == op
+    end
+    for i, o in ipairs(state.ops) do
+      if o == op and not named then
+        table.remove(state.ops, i)
+        break
       end
     end
-    state.action = {
-      status = status,
-      at = now,
-      desc = state.lastActionDesc,
-      source = source,
-      manual = manual,
-      attributed = attributed,
-      historyEntry = historyEntry,
-    }
-    -- A physical operation with no actor in the packet: the event log has the
-    -- source and user, so fetch it and upgrade this action's attribution.
-    if not attributed and manual then
+  end
+  if c then
+    c.entry = addHistory(STATUS_LABEL[status] or status, c.op and c.op.source or c.source)
+  elseif moved then
+    saveHistory()
+  end
+
+  -- The proxy is told the newest change as the lock's report named it, or the
+  -- operation that set a status out of UNKNOWN; a reading that set one names none.
+  local told = state.told
+  local newest = state.changes[#state.changes]
+  if newest and newest.status == state.lockStatus then
+    told = newest.op or { desc = STATUS_LABEL[newest.status] or "", source = newest.source, manual = newest.manual }
+  elseif changed then
+    told = op or { desc = told.desc, source = "Control4", manual = false }
+  end
+  state.told = told
+  notifyLockChanged(told.desc, told.source, told.manual)
+  log:info("Lock is %s (%s)", status, tostring(told.desc))
+  if c then
+    if c.manual and not c.op then
+      -- A physical operation with no actor in the packet: the event log has it.
       requestLogAttribution()
     end
+    if status == STATUS_LOCKED then
+      C4:FireEvent(EVENT_LOCKED)
+    elseif status == STATUS_UNLOCKED then
+      C4:FireEvent(EVENT_UNLOCKED)
+    elseif status == STATUS_FAULT then
+      C4:FireEvent(EVENT_JAMMED)
+    end
   end
-  log:info("Lock is %s (%s)", status, tostring(state.lastActionDesc or ""))
 end
 
 local function pollLockState()
@@ -1167,7 +1255,10 @@ end
 --- @param code integer ZCL OperationEvent code
 --- @param src integer ZCL OperationEventSource byte
 --- @param uid integer user id on the lock (0xFFFF = none)
-local function attributeOperation(st, code, src, uid)
+--- @param at integer when it happened, on the lock's clock
+--- @param live boolean an operation event, not a log record
+--- @param timed boolean `at` is the lock's own time, not the arrival
+local function attributeOperation(st, code, src, uid, at, live, timed)
   local rf = src == 0x01
   local ours = rf and (os.time() - (state.cmdSentAt or 0)) <= CMD_ORIGIN_SECS
   local manner = ours and "Control4" or (DOORLOCK_EVENT_MANNER[code] or OP_EVENT_SOURCE[src] or "Lock")
@@ -1183,7 +1274,7 @@ local function attributeOperation(st, code, src, uid)
     desc = desc .. " by " .. who
   end
   desc = desc .. " (" .. manner .. ")"
-  applyLockStatus(st, desc, who, not rf)
+  applyLockStatus(st, { at = at, timed = timed, desc = desc, source = who, manual = not rf, live = live })
 end
 
 --- Set or clear a user's PIN on the lock, per ZCL DoorLock, at the user's slot.
@@ -1205,24 +1296,6 @@ end
 -- Weekday bit values; SCHEDULED_DAYS[1]=Sunday .. [7]=Saturday and the ZCL
 -- weekday DaysMask has bit0=Sunday .. bit6=Saturday.
 local WEEKDAY_BITS = { 1, 2, 4, 8, 16, 32, 64 }
-
---- ZCL LocalTime for a date and a minute of that day: seconds since 2000-01-01
---- 00:00 on the lock's clock, which keeps local wall-clock time (DST included),
---- so it is counted on the calendar alone, with no time zone.
---- @param year integer
---- @param month integer
---- @param day integer
---- @param minutes integer Minutes from midnight.
---- @return integer
-local function zclLocalTime(year, month, day, minutes)
-  -- Days from 1970-01-01 (Hinnant's days_from_civil), less the 10957 to 2000-01-01.
-  local y = month <= 2 and year - 1 or year
-  local era = math.floor(y / 400)
-  local yoe = y - era * 400
-  local doy = math.floor((153 * ((month + 9) % 12) + 2) / 5) + day - 1
-  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
-  return (era * 146097 + doe - 719468 - 10957) * 86400 + minutes * 60
-end
 
 --- Push a user's schedule to the lock (ZCL DoorLock) at the user's slot. A
 --- restricted user gets a weekday or yearday schedule; an unrestricted user has
@@ -2210,7 +2283,7 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
             -- Bare LOCK_STATE report: no actor in the packet. applyLockStatus
             -- infers it (our recent command vs a physical operation) and keeps
             -- the prior description on an unchanged read.
-            applyLockStatus(ls, nil, nil, nil)
+            applyLockStatus(ls)
           end
         end
         -- Capability limits reported by the lock; use them for validation.
@@ -2263,35 +2336,33 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         end
         confirmSeq(seq, status)
       elseif clusterSpecific and cmd == DL_OPER_EVENT and #payload >= 2 then
-        -- OperationEventNotification: source(u8) code(u8) userId(u16le) ...
-        -- This firmware only pushes it for one-touch locking; keypad and manual
-        -- operations are recovered from the event log instead (GetLogRecord).
+        -- OperationEventNotification: source(u8) code(u8) userId(u16) pin(octstr)
+        -- localTime(u32) data(octstr). The bound lock pushes one for each operation;
+        -- the PIN is skipped, never read.
         local src = payload:byte(1)
         local code = payload:byte(2)
         local uid = (#payload >= 4) and (payload:byte(3) + payload:byte(4) * 256) or 0xFFFF
+        local at = payload:byte(5) and u32At(payload, 6 + payload:byte(5))
+        -- Its time pairs it only when the lock's clock agrees with the controller's;
+        -- one with none (or a clock that is off) is taken as just done.
+        local now = lockNow()
+        local timed = at ~= nil and at >= now - MATCH_LATE_SECS and at <= now + MATCH_EARLY_SECS
         local ls = DOORLOCK_EVENT[code]
         if ls then
-          attributeOperation(zclLockStatus(ls), code, src, uid)
+          attributeOperation(zclLockStatus(ls), code, src, uid, timed and at or now, true, timed)
         end
       elseif clusterSpecific and cmd == DL_GET_LOG_RECORD and #payload >= 11 then
         -- GetLogRecordResponse: logEntryId(u16) timestamp(u32) eventType(u8)
         -- source(u8) eventCode(u8) userId(u16) pin(octstr). The trailing PIN is
         -- cleartext and is deliberately never read. Only operation records
-        -- (eventType 0) attribute a lock action; only when the record describes
-        -- the current state (else the log has not caught up) and is one we have
-        -- not already applied.
-        local entryId = payload:byte(1) + payload:byte(2) * 256
+        -- (eventType 0) attribute a lock action, by their time on the lock's clock.
         local eventType = payload:byte(7)
         local src = payload:byte(8)
         local code = payload:byte(9)
         local uid = payload:byte(10) + payload:byte(11) * 256
         local ls = DOORLOCK_EVENT[code]
-        if eventType == 0 and ls and entryId ~= state.lastLogEntryId then
-          local st = zclLockStatus(ls)
-          if st == state.lockStatus then
-            state.lastLogEntryId = entryId
-            attributeOperation(st, code, src, uid)
-          end
+        if eventType == 0 and ls then
+          attributeOperation(zclLockStatus(ls), code, src, uid, u32At(payload, 3), false, true)
         end
       elseif clusterSpecific and cmd == DL_GET_PIN then
         -- The lock understood GetPINCode, so it has a keypad. Restore user
