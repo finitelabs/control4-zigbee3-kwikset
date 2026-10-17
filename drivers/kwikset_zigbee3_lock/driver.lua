@@ -397,6 +397,30 @@ local function notify(strCommand, tParams)
   SendToProxy(PROXY_BINDING, strCommand, tParams or {}, "NOTIFY")
 end
 
+-- What a log line shows in place of a lock code.
+local REDACTED = "***REDACTED***"
+
+--- Tell the proxy something that carries a lock code. SendToProxy's trace would log
+--- it whole, so it goes to C4 directly and is traced with each code redacted.
+--- @param strCommand string
+--- @param tParams table|string What the proxy is sent.
+--- @param shown table|string The same, as the trace shows it.
+local function notifySecret(strCommand, tParams, shown)
+  log:trace("C4:SendToProxy(%s, %s, %s, NOTIFY)", PROXY_BINDING, strCommand, shown)
+  C4:SendToProxy(PROXY_BINDING, strCommand, tParams, "NOTIFY")
+end
+
+--- `xml` with the text of every `tag` element redacted.
+--- @param xml string
+--- @param tag string
+--- @return string
+local function redactXml(xml, tag)
+  return (xml:gsub("<" .. tag .. ">.-</" .. tag .. ">", "<" .. tag .. ">" .. REDACTED .. "</" .. tag .. ">"))
+end
+
+-- The vendored proxy handler prints a command's params at Ultra; these carry a code.
+RFP.suppressDebug[PROXY_BINDING] = { ADD_USER = true, EDIT_USER = true, SET_ADMIN_CODE = true }
+
 -- Proxy XML payloads are built with the vendored XMLTag (drivers-common-public):
 -- XMLTag(tag, value) escapes the text value; XMLTag(tag, inner, nil, false)
 -- wraps already-built child markup verbatim.
@@ -593,7 +617,8 @@ local function notifyUsers()
       .. XMLTag("scheduled_days", s.days or DEFAULT_SCHEDULED_DAYS)
       .. "</user>"
   end
-  notify("USERS", XMLTag("lock_users", body, nil, false))
+  local xml = XMLTag("lock_users", body, nil, false)
+  notifySecret("USERS", xml, redactXml(xml, "passcode"))
 end
 
 -- ---------------------------------------------------------------------------
@@ -1451,7 +1476,8 @@ local function notifySettings()
     .. XMLTag("language", "English")
     .. setting("attr:volume")
     .. setting("attr:onetouch")
-  notify("SETTINGS", XMLTag("lock_settings", body, nil, false))
+  local xml = XMLTag("lock_settings", body, nil, false)
+  notifySecret("SETTINGS", xml, redactXml(xml, "admin_code"))
 end
 
 --- Take a Control4 change to a lock setting. It is written, as an owed write,
@@ -1820,7 +1846,9 @@ local function upsertUser(tParams, isEdit)
     writeUserPin(id, u.active and u.code or nil)
   end
   writeUserSchedule(id, u)
-  notify(isEdit and "USER_CHANGED" or "USER_ADDED", userFields(id, u))
+  local fields, shown = userFields(id, u), userFields(id, u)
+  shown.PASSCODE = REDACTED
+  notifySecret(isEdit and "USER_CHANGED" or "USER_ADDED", fields, shown)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1949,14 +1977,15 @@ function RFP.SET_ADMIN_CODE(idBinding, strCommand, tParams)
     return
   end
   local code = tostring(Select(tParams, "PASSCODE") or "")
+  local shown = { NAME = "admin_code", VALUE = REDACTED }
   if code == state.adminCode then
-    notify("SETTING_CHANGED", { NAME = "admin_code", VALUE = code })
+    notifySecret("SETTING_CHANGED", { NAME = "admin_code", VALUE = code }, shown)
     return
   end
   state.adminCode = code
   -- The admin code is a secret; it only ever persists encrypted.
   persist:set("adminCode", state.adminCode, true)
-  notify("SETTING_CHANGED", { NAME = "admin_code", VALUE = state.adminCode })
+  notifySecret("SETTING_CHANGED", { NAME = "admin_code", VALUE = state.adminCode }, shown)
   addHistory("Changed Admin Code", "Control4")
 end
 

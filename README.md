@@ -315,6 +315,9 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
   settings the lock reports are offered, and a value it refuses now reads "Not
   supported by this device" and is not sent again (keypad volume low used to be
   turned into high)
+- Fixed user codes and the admin code showing in plain text in the driver's log
+  at the Trace and Ultra log levels; the log now shows `***REDACTED***` in their
+  place
 
 ### Changed
 

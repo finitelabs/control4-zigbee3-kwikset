@@ -53,8 +53,10 @@ local function save(users, tParams)
     captureSchedule = function() end,
     saveUsers = function() end,
     writeUserSchedule = function() end,
-    notify = function() end,
-    userFields = function() end,
+    notifySecret = function() end,
+    userFields = function()
+      return {}
+    end,
     freeSlot = function()
       return 3
     end,
