@@ -60,10 +60,16 @@ end
 function C4:GetVersionInfo()
   return { version = "4.3.0" }
 end
--- The events the driver fires, as it names them.
+-- The events the driver fires, by id or by name. As on a controller, C4:FireEvent
+-- given a number (or its digits) fires nothing (dev, 4.3.0).
 local fired = {}
-function C4:FireEvent(event)
-  fired[#fired + 1] = event
+function C4:FireEventByID(id)
+  fired[#fired + 1] = id
+end
+function C4:FireEvent(name)
+  if type(name) == "string" and not tonumber(name) then
+    fired[#fired + 1] = name
+  end
 end
 -- What the driver tells the lock proxy.
 local proxied = {}

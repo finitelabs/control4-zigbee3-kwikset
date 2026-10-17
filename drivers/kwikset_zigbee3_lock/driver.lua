@@ -1171,11 +1171,11 @@ local function applyLockStatus(status, op)
       requestLogAttribution()
     end
     if status == STATUS_LOCKED then
-      C4:FireEvent(EVENT_LOCKED)
+      C4:FireEventByID(EVENT_LOCKED)
     elseif status == STATUS_UNLOCKED then
-      C4:FireEvent(EVENT_UNLOCKED)
+      C4:FireEventByID(EVENT_UNLOCKED)
     elseif status == STATUS_FAULT then
-      C4:FireEvent(EVENT_JAMMED)
+      C4:FireEventByID(EVENT_JAMMED)
     end
   end
 end
@@ -2432,7 +2432,7 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
           notifyBattery()
         end
         if pct <= 15 and prev ~= nil and prev > 15 then
-          C4:FireEvent(EVENT_BATTERY_LOW)
+          C4:FireEventByID(EVENT_BATTERY_LOW)
         end
       end
     end
