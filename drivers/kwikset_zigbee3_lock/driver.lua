@@ -2280,6 +2280,12 @@ function OnZigbeePacketIn(packet, _profileId, clusterId, _groupId, srcEndpoint, 
         end
       end
     elseif clusterId == CLUSTER_DOORLOCK then
+      -- Only the bind brings an event or a report, so one shows DoorLock bound even when
+      -- the record a load kept does not (Director skips a list it already holds).
+      local pushed = (clusterSpecific and cmd == DL_OPER_EVENT) or (not clusterSpecific and cmd == ZCL_REPORT_ATTR)
+      if pushed and binder and binder:noteTraffic(srcEndpoint, CLUSTER_DOORLOCK) and state.online then
+        armStatePoll()
+      end
       if not clusterSpecific and (cmd == ZCL_REPORT_ATTR or cmd == ZCL_READ_ATTR_RSP) then
         local attrs = decodeAttributes(payload, cmd)
         if attrs[ATTR_LOCK_STATE] and attrs[ATTR_LOCK_STATE].value ~= nil then

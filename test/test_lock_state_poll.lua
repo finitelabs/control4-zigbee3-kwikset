@@ -136,6 +136,34 @@ do
 end
 
 --------------------------------------------------------------------------------
+T.section("with a record that kept nothing bound, the lock's first push stops the 30 s read")
+--------------------------------------------------------------------------------
+do
+  -- As on Front Porch after an update: synced, nothing bound, and Director skips the
+  -- same list, so no state comes.
+  F.start(store({
+    zbindCoordEui = COORD,
+    zbindCoordZserver = 20,
+    zbindList = { eui = "00124B0001AABBCC", refused = {}, bound = {}, state = "synced" },
+  }))
+  OnZigbeeOnlineStatusChanged("ONLINE", "", "")
+  T.truthy("the 30 s read is armed", Timer.StatePoll)
+  readLockState(1)
+  T.truthy("a poll's answer is no sign of the bind", Timer.StatePoll)
+  keypadUnlock()
+  T.eq("the lock's own event is, and the 30 s read stops", Timer.StatePoll, nil)
+  T.truthy("the hourly read stays", Timer.BatteryPoll)
+  F.start(store({
+    zbindCoordEui = COORD,
+    zbindCoordZserver = 20,
+    zbindList = { eui = "00124B0001AABBCC", refused = {}, bound = {}, state = "synced" },
+  }))
+  OnZigbeeOnlineStatusChanged("ONLINE", "", "")
+  F.receive(F.DOORLOCK, false, 0x42, 0x0A, F.attr(0x0000, 0x30, 1))
+  T.eq("so does a report", Timer.StatePoll, nil)
+end
+
+--------------------------------------------------------------------------------
 T.section("a lock that refuses the DoorLock bind keeps the 30 s read")
 --------------------------------------------------------------------------------
 do
