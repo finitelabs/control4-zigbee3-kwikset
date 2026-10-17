@@ -44,6 +44,18 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
   settings the lock reports are offered, and a value it refuses now reads "Not
   supported by this device" and is not sent again (keypad volume low used to be
   turned into high)
+- Fixed the lock's history in the Control4 app ending at the driver's last load,
+  however many operations the driver had recorded since: each entry is now sent
+  as it is recorded
+- Fixed a keypad user's name landing on an earlier thumbturn lock or unlock in
+  the lock's history when the lock's reports arrived late or out of order: each
+  report now names the operation it describes by the time on the lock's own
+  clock
+- Fixed the lock's last action changing to Control4 within 30 seconds of a
+  keypad or thumbturn operation: a status read that finds the lock as it was no
+  longer reports anything
+- Fixed the Locked, Unlocked, Jammed, and Battery Low events never firing, so
+  programming on them now runs
 
 ### Changed
 
@@ -51,6 +63,9 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
   API, so keypad, thumbturn, and one-touch operations show as they happen
 - Changed the auto-lock, wrong code attempts, and shutout timer lists to follow
   the lock: a value it refuses is dropped, and one set at the lock is added
+- Changed the lock status read every 30 seconds to stop once the lock sends a
+  real-time update after the driver loads; after that the status is read hourly
+  with the battery, so the lock is no longer woken every 30 seconds
 
 ## v20260825 - 2026-08-25
 

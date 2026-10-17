@@ -60,6 +60,17 @@ end
 function C4:GetVersionInfo()
   return { version = "4.3.0" }
 end
+-- The events the driver fires, by id or by name. As on a controller, C4:FireEvent
+-- given a number (or its digits) fires nothing (dev, 4.3.0).
+local fired = {}
+function C4:FireEventByID(id)
+  fired[#fired + 1] = id
+end
+function C4:FireEvent(name)
+  if type(name) == "string" and not tonumber(name) then
+    fired[#fired + 1] = name
+  end
+end
 -- What the driver tells the lock proxy.
 local proxied = {}
 function C4:SendToProxy(binding, command, params)
@@ -101,6 +112,7 @@ local seeded = {}
 --- Load the driver as Director does after a driver update, over a store holding
 --- `seed` (lib.persist keys and values).
 --- @param seed table
+--- @return table ctl The ZigbeeV2 shim's controller.
 function F.start(seed)
   KillAllTimers()
   ShimPersistLand()
@@ -117,8 +129,9 @@ function F.start(seed)
   end
   ShimPersistLand()
   persist._persist = {}
-  ShimInstallZigbeeV2()
+  local ctl = ShimInstallZigbeeV2()
   load("DIT_UPDATING")
+  return ctl
 end
 
 --- Load the driver again after a driver update, over what the last load stored.
@@ -234,6 +247,13 @@ function F.proxy(command, params)
   ShimPersistLand()
   RFP[command](F.PROXY, command, params or {})
   ShimPersistLand()
+end
+
+--- The events fired since the last call, in order.
+function F.fired()
+  local out = fired
+  fired = {}
+  return out
 end
 
 --- Everything the proxy was told since the last call, as { command, params }.
