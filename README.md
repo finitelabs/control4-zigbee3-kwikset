@@ -328,6 +328,8 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
 - Fixed the lock's last action changing to Control4 within 30 seconds of a
   keypad or thumbturn operation: a status read that finds the lock as it was no
   longer reports anything
+- Fixed the Locked, Unlocked, Jammed, and Battery Low events never firing, so
+  programming on them now runs
 
 ### Changed
 
@@ -335,9 +337,9 @@ Template for a new release entry (copy below the heading, fill in, uncomment):
   API, so keypad, thumbturn, and one-touch operations show as they happen
 - Changed the auto-lock, wrong code attempts, and shutout timer lists to follow
   the lock: a value it refuses is dropped, and one set at the lock is added
-- Changed the lock status read every 30 seconds to run only until the lock's
-  real-time binding is in place; after that the status is read hourly with the
-  battery, so the lock is no longer woken every 30 seconds
+- Changed the lock status read every 30 seconds to stop once the lock sends a
+  real-time update after the driver loads; after that the status is read hourly
+  with the battery, so the lock is no longer woken every 30 seconds
 
 ## v20260825 - 2026-08-25
 
